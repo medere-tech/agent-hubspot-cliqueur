@@ -47,8 +47,14 @@ export default auth(async function middleware(req: NextRequest) {
     }
   }
 
-  // Auth protection
+  // Auth protection — API routes return 401, pages redirect to /login
   if (!isPublic(pathname) && !session) {
+    if (pathname.startsWith('/api/')) {
+      return new NextResponse(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
     return NextResponse.redirect(new URL('/login', req.url))
   }
 

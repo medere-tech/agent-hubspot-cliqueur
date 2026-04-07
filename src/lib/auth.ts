@@ -35,24 +35,6 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     signIn: '/login',
   },
   callbacks: {
-    authorized({ auth: session, request: { nextUrl } }) {
-      const isLoggedIn = !!session?.user
-      const isLoginPage = nextUrl.pathname === '/login'
-      const isPublicPath =
-        isLoginPage ||
-        nextUrl.pathname === '/' ||
-        nextUrl.pathname.startsWith('/api/auth')
-
-      if (!isPublicPath && !isLoggedIn) {
-        return Response.redirect(new URL('/login', nextUrl))
-      }
-
-      if (isLoginPage && isLoggedIn) {
-        return Response.redirect(new URL('/dashboard', nextUrl))
-      }
-
-      return true
-    },
     jwt({ token, user }) {
       if (user) {
         token.id = user.id
