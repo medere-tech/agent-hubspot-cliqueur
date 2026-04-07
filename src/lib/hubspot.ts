@@ -15,12 +15,27 @@ export interface ParsedCampaignName {
 
 export interface HubSpotCampaignRaw {
   id: string
-  name: string
-  startDate: string | null
-  endDate: string | null
+  properties: {
+    hs_name?: string | null
+    hs_start_date?: string | null
+    hs_end_date?: string | null
+  }
   createdAt: string
   updatedAt: string
-  currencyCode?: string
+}
+
+export interface HubSpotEmailRaw {
+  id: string
+  properties: {
+    hs_name?: string | null
+    hs_subject?: string | null
+    hs_send_date?: string | null
+    hs_email_status?: string | null
+    hs_opens_count?: string | null
+    hs_clicks_count?: string | null
+  }
+  createdAt: string
+  updatedAt: string
 }
 
 export interface Campaign extends ParsedCampaignName {
@@ -32,8 +47,21 @@ export interface Campaign extends ParsedCampaignName {
   updatedAt: string
 }
 
-interface HubSpotListResponse {
-  results: HubSpotCampaignRaw[]
+export interface MarketingEmail extends ParsedCampaignName {
+  id: string
+  name: string
+  subject: string | null
+  sendDate: string | null
+  status: string | null
+  opensCount: number | null
+  clicksCount: number | null
+  createdAt: string
+  updatedAt: string
+}
+
+interface HubSpotListResponse<T> {
+  total?: number
+  results: T[]
   paging?: {
     next?: {
       after: string
@@ -45,9 +73,15 @@ interface HubSpotListResponse {
 
 const HUBSPOT_BASE_URL = 'https://api.hubapi.com'
 
+interface FetchOptions {
+  /** Next.js ISR revalidation in seconds. Omit for no-store. */
+  revalidate?: number
+}
+
 async function hubspotFetch<T>(
   path: string,
-  params: Record<string, string> = {}
+  params: Record<string, string> = {},
+  options: FetchOptions = {}
 ): Promise<T> {
   const token = process.env.HUBSPOT_ACCESS_TOKEN
   if (!token) throw new Error('HUBSPOT_ACCESS_TOKEN is not set')
@@ -57,12 +91,17 @@ async function hubspotFetch<T>(
     url.searchParams.set(key, value)
   }
 
+  const nextOptions =
+    options.revalidate !== undefined
+      ? { next: { revalidate: options.revalidate } }
+      : { cache: 'no-store' as const }
+
   const res = await fetch(url.toString(), {
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    cache: 'no-store',
+    ...nextOptions,
   })
 
   if (!res.ok) {
@@ -94,7 +133,7 @@ export function parseEmailName(name: string): ParsedCampaignName {
     working = working.replace(/^\(A\)\s*/i, '').trim()
   }
 
-  // 2. Extract envoi + periode from end: (Xème envoi MMAAAA) / (Xeme envoi MMAAAA)
+  // 2. Extract envoi + periode from end
   let envoi: number | null = null
   let periode: string | null = null
 
@@ -119,9 +158,7 @@ export function parseEmailName(name: string): ParsedCampaignName {
 
   // 5. Audience (second segment — may contain sub-segment like "MG (prospect)")
   const rawAudience = parts[1] ?? ''
-  // Strip any parenthesised qualifier like "(prospect)"
   const audienceBase = rawAudience.replace(/\s*\([^)]+\)/g, '').trim().toUpperCase()
-  // Also check the qualifier itself for PROSPECT / CLIENTS
   const qualifierMatch = rawAudience.match(/\(([^)]+)\)/i)
   const qualifier = qualifierMatch?.[1]?.trim().toUpperCase() ?? ''
 
@@ -133,7 +170,6 @@ export function parseEmailName(name: string): ParsedCampaignName {
   else if (audienceBase === 'CLIENTS' || qualifier === 'CLIENTS') audience = 'CLIENTS'
 
   // 6. Edition + theme from remaining segments
-  // Edition = short all-caps + digits segment like RM7, RM8 — no spaces
   const EDITION_RE = /^[A-Z]{1,4}\d+$/
   const remaining = parts.slice(2)
 
@@ -153,8 +189,8 @@ export function parseEmailName(name: string): ParsedCampaignName {
 // ─── getCampaigns ─────────────────────────────────────────────────────────────
 
 /**
- * Fetch all marketing campaigns from HubSpot for the given period,
- * then parse each name with parseEmailName.
+ * Fetch all marketing campaign groups from HubSpot.
+ * Requires scope: marketing.campaigns.read
  */
 export async function getCampaigns(days: 7 | 28 | 90 | 360): Promise<Campaign[]> {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
@@ -163,36 +199,96 @@ export async function getCampaigns(days: 7 | 28 | 90 | 360): Promise<Campaign[]>
   const allRaw: HubSpotCampaignRaw[] = []
   let after: string | undefined
 
-  // Paginate through all results
   do {
     const params: Record<string, string> = {
       limit: '100',
+      properties: 'hs_name,hs_start_date,hs_end_date',
       ...(after ? { after } : {}),
     }
 
-    const page = await hubspotFetch<HubSpotListResponse>(
+    const page = await hubspotFetch<HubSpotListResponse<HubSpotCampaignRaw>>(
       '/marketing/v3/campaigns',
-      params
+      params,
+      { revalidate: 300 }
     )
 
     allRaw.push(...page.results)
     after = page.paging?.next?.after
   } while (after)
 
-  // Filter by creation date on our side (API doesn't expose date range filter)
-  const filtered = allRaw.filter((c) => {
-    const date = c.createdAt ?? c.updatedAt
+  const filtered = allRaw.filter((c) => c.updatedAt >= sinceIso)
+
+  return filtered.map((c) => {
+    const name = c.properties.hs_name?.trim() || 'Sans nom'
+    return {
+      id: c.id,
+      name,
+      startDate: c.properties.hs_start_date ?? null,
+      endDate: c.properties.hs_end_date ?? null,
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt,
+      ...parseEmailName(name),
+    }
+  })
+}
+
+// ─── getMarketingEmails ───────────────────────────────────────────────────────
+
+/**
+ * Fetch individual marketing email sends from HubSpot.
+ * Requires scope: content
+ * Returns empty array and logs a warning if the scope is missing (403).
+ */
+export async function getMarketingEmails(
+  days: 7 | 28 | 90 | 360
+): Promise<MarketingEmail[]> {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+  const sinceIso = since.toISOString()
+
+  const EMAIL_PROPERTIES =
+    'hs_name,hs_subject,hs_send_date,hs_email_status,hs_opens_count,hs_clicks_count'
+
+  const allRaw: HubSpotEmailRaw[] = []
+  let after: string | undefined
+
+  do {
+    const params: Record<string, string> = {
+      limit: '50',
+      properties: EMAIL_PROPERTIES,
+      ...(after ? { after } : {}),
+    }
+
+    const page = await hubspotFetch<HubSpotListResponse<HubSpotEmailRaw>>(
+      '/marketing/v3/emails',
+      params,
+      { revalidate: 300 }
+    )
+
+    allRaw.push(...page.results)
+    after = page.paging?.next?.after
+  } while (after)
+
+  // Filter on send date if available, otherwise fall back to updatedAt
+  const filtered = allRaw.filter((e) => {
+    const date = e.properties.hs_send_date ?? e.updatedAt
     return date >= sinceIso
   })
 
-  // Parse and assemble
-  return filtered.map((c) => ({
-    id: c.id,
-    name: c.name,
-    startDate: c.startDate ?? null,
-    endDate: c.endDate ?? null,
-    createdAt: c.createdAt,
-    updatedAt: c.updatedAt,
-    ...parseEmailName(c.name),
-  }))
+  return filtered.map((e) => {
+    const name = e.properties.hs_name?.trim() || 'Sans nom'
+    const opensRaw = e.properties.hs_opens_count
+    const clicksRaw = e.properties.hs_clicks_count
+    return {
+      id: e.id,
+      name,
+      subject: e.properties.hs_subject ?? null,
+      sendDate: e.properties.hs_send_date ?? null,
+      status: e.properties.hs_email_status ?? null,
+      opensCount: opensRaw != null ? parseInt(opensRaw, 10) : null,
+      clicksCount: clicksRaw != null ? parseInt(clicksRaw, 10) : null,
+      createdAt: e.createdAt,
+      updatedAt: e.updatedAt,
+      ...parseEmailName(name),
+    }
+  })
 }
