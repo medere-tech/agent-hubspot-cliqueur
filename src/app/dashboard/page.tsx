@@ -4,6 +4,18 @@ import type { Campaign, MarketingEmail, EmailType } from '@/lib/hubspot'
 import { EMAIL_TYPE_LABELS } from '@/lib/hubspot'
 import { useCallback, useEffect, useState } from 'react'
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const PAGE_SIZE = 20
+
+const TYPE_FILTER_OPTIONS: Array<{ value: EmailType | 'ALL'; label: string }> = [
+  { value: 'ALL',       label: 'Tous' },
+  { value: 'CV',        label: 'Classe virtuelle' },
+  { value: 'PRES',      label: 'Présentiel' },
+  { value: 'EL',        label: 'E-learning' },
+  { value: 'WEBINAIRE', label: 'Webinaire' },
+]
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Period = 7 | 28 | 90 | 360
@@ -48,8 +60,8 @@ function computeThemeRows(emails: MarketingEmail[]): ThemeRow[] {
         if (!existing.audiences.includes(a)) existing.audiences.push(a)
       }
       if (e.isABTest) existing.isABTest = true
-      existing.totalClicks += e.clicks
-      existing.totalOpens += e.opens
+      existing.totalClicks    += e.clicks
+      existing.totalOpens     += e.opens
       existing.totalDelivered += e.delivered
     } else {
       map.set(key, {
@@ -70,28 +82,18 @@ function computeThemeRows(emails: MarketingEmail[]): ThemeRow[] {
   )
 }
 
-// ─── Skeleton ─────────────────────────────────────────────────────────────────
+// ─── Sub-components ───────────────────────────────────────────────────────────
 
 function Skeleton({ className }: { className?: string }) {
   return <div className={`bg-[#f5f5f5] rounded-[4px] animate-pulse ${className ?? ''}`} />
 }
 
-// ─── Metric card ──────────────────────────────────────────────────────────────
-
 function MetricCard({
-  label,
-  value,
-  loading,
-}: {
-  label: string
-  value: string | number
-  loading: boolean
-}) {
+  label, value, loading,
+}: { label: string; value: string | number; loading: boolean }) {
   return (
     <div className="bg-white border border-[#e5e5e5] rounded-[6px] p-5">
-      <p className="text-xs text-[#737373] font-medium tracking-wide uppercase mb-3">
-        {label}
-      </p>
+      <p className="text-xs text-[#737373] font-medium tracking-wide uppercase mb-3">{label}</p>
       {loading ? (
         <Skeleton className="h-7 w-16" />
       ) : (
@@ -108,8 +110,16 @@ export default function DashboardPage() {
   const [data, setData] = useState<ApiResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [search, setSearch] = useState('')
 
+  // Filtres
+  const [search, setSearch] = useState('')
+  const [typeFilter, setTypeFilter] = useState<EmailType | 'ALL'>('ALL')
+  const [audienceFilter, setAudienceFilter] = useState<string>('ALL')
+
+  // Pagination (0-based)
+  const [page, setPage] = useState(0)
+
+  // ── Fetch ──────────────────────────────────────────────────────────────────
   const fetchData = useCallback(async (days: Period) => {
     setLoading(true)
     setError('')
@@ -125,21 +135,35 @@ export default function DashboardPage() {
     }
   }, [])
 
-  useEffect(() => {
-    fetchData(period)
-  }, [period, fetchData])
+  useEffect(() => { fetchData(period) }, [period, fetchData])
 
+  // Reset page when any filter or period changes
+  useEffect(() => { setPage(0) }, [search, typeFilter, audienceFilter, period])
+
+  // ── Data derivation ────────────────────────────────────────────────────────
   const campaigns = data?.campaigns
-  const emails = data?.emails
+  const emails    = data?.emails
   const emailList = emails?.data ?? []
 
-  const uniqueThemes = new Set(emailList.map((e) => e.theme)).size
+  const uniqueThemes    = new Set(emailList.map((e) => e.theme)).size
   const uniqueAudiences = new Set(emailList.flatMap((e) => e.audiences)).size
-  const themeRows = computeThemeRows(emailList)
+  const themeRows       = computeThemeRows(emailList)
+
+  // All distinct audiences for the dropdown
+  const allAudiences = [...new Set(emailList.flatMap((e) => e.audiences))].sort()
+
+  // ── Filtering pipeline ─────────────────────────────────────────────────────
+  const afterType = typeFilter === 'ALL'
+    ? themeRows
+    : themeRows.filter((r) => r.type === typeFilter)
+
+  const afterAudience = audienceFilter === 'ALL'
+    ? afterType
+    : afterType.filter((r) => r.audiences.includes(audienceFilter))
 
   const filteredRows = search.trim()
-    ? themeRows.filter((row) => {
-        const q = search.toLowerCase()
+    ? afterAudience.filter((row) => {
+        const q         = search.toLowerCase()
         const typeLabel = (EMAIL_TYPE_LABELS[row.type as EmailType] ?? row.type).toLowerCase()
         return (
           row.theme.toLowerCase().includes(q) ||
@@ -147,7 +171,18 @@ export default function DashboardPage() {
           row.audiences.some((a) => a.toLowerCase().includes(q))
         )
       })
-    : themeRows
+    : afterAudience
+
+  const totalRows = filteredRows.length
+  const pageRows  = filteredRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const hasFilters = typeFilter !== 'ALL' || audienceFilter !== 'ALL' || search.trim() !== ''
+
+  const resetFilters = () => {
+    setSearch('')
+    setTypeFilter('ALL')
+    setAudienceFilter('ALL')
+    setPage(0)
+  }
 
   const PERIODS: { label: string; value: Period }[] = [
     { label: '7 j', value: 7 },
@@ -156,18 +191,20 @@ export default function DashboardPage() {
     { label: '360 j', value: 360 },
   ]
 
+  // ── Pagination helpers ─────────────────────────────────────────────────────
+  const hasPrev = page > 0
+  const hasNext = (page + 1) * PAGE_SIZE < totalRows
+  const rangeStart = totalRows === 0 ? 0 : page * PAGE_SIZE + 1
+  const rangeEnd   = Math.min((page + 1) * PAGE_SIZE, totalRows)
+
   return (
     <div className="px-8 py-8 max-w-[1200px]">
 
-      {/* Header */}
+      {/* ── Header ──────────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between mb-8">
         <div>
-          <h1 className="text-xl font-semibold text-[#0a0a0a] tracking-tight">
-            Tableau de bord
-          </h1>
-          <p className="text-sm text-[#737373] mt-0.5">
-            Analyse des campagnes email HubSpot
-          </p>
+          <h1 className="text-xl font-semibold text-[#0a0a0a] tracking-tight">Tableau de bord</h1>
+          <p className="text-sm text-[#737373] mt-0.5">Analyse des campagnes email HubSpot</p>
         </div>
 
         <div className="flex items-center border border-[#e5e5e5] rounded-[4px] overflow-hidden">
@@ -187,7 +224,7 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Error */}
+      {/* ── Error ───────────────────────────────────────────────────────────── */}
       {error && (
         <div className="flex items-center gap-2.5 px-4 py-3 mb-6 border border-red-200 bg-red-50 rounded-[4px]">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0" aria-hidden="true">
@@ -198,32 +235,16 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Metric cards */}
+      {/* ── Metric cards ────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-4 gap-4 mb-8">
-        <MetricCard
-          label="Total campagnes"
-          value={campaigns?.count ?? 0}
-          loading={loading}
-        />
-        <MetricCard
-          label="Emails envoyés"
-          value={emails?.count ?? 0}
-          loading={loading}
-        />
-        <MetricCard
-          label="Thématiques uniques"
-          value={uniqueThemes}
-          loading={loading}
-        />
-        <MetricCard
-          label="Audiences actives"
-          value={uniqueAudiences}
-          loading={loading}
-        />
+        <MetricCard label="Total campagnes"    value={campaigns?.count ?? 0} loading={loading} />
+        <MetricCard label="Emails envoyés"     value={emails?.count ?? 0}    loading={loading} />
+        <MetricCard label="Thématiques"        value={uniqueThemes}           loading={loading} />
+        <MetricCard label="Audiences actives"  value={uniqueAudiences}        loading={loading} />
       </div>
 
-      {/* Search bar */}
-      <div className="relative mb-4">
+      {/* ── Search bar ──────────────────────────────────────────────────────── */}
+      <div className="relative mb-3">
         <span className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
             <circle cx="5.5" cy="5.5" r="4" stroke="#a3a3a3" strokeWidth="1.2" />
@@ -239,15 +260,73 @@ export default function DashboardPage() {
         />
       </div>
 
-      {/* Theme table */}
+      {/* ── Filters row ─────────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        {/* Type buttons */}
+        <div className="flex items-center gap-1">
+          {TYPE_FILTER_OPTIONS.map(({ value, label }) => (
+            <button
+              key={value}
+              onClick={() => setTypeFilter(value)}
+              className={`px-3 py-1.5 text-xs font-medium rounded-[4px] border transition-colors ${
+                typeFilter === value
+                  ? 'bg-[#0a0a0a] text-white border-[#0a0a0a]'
+                  : 'bg-white text-[#737373] border-[#e5e5e5] hover:border-[#0a0a0a] hover:text-[#0a0a0a]'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* Separator */}
+        <div className="w-px h-4 bg-[#e5e5e5]" />
+
+        {/* Audience dropdown */}
+        <div className="relative">
+          <select
+            value={audienceFilter}
+            onChange={(e) => setAudienceFilter(e.target.value)}
+            className="appearance-none pl-3 pr-7 py-1.5 text-xs font-medium text-[#737373] bg-white border border-[#e5e5e5] rounded-[4px] outline-none focus:border-[#0a0a0a] focus:ring-1 focus:ring-[#0a0a0a] transition-colors cursor-pointer hover:border-[#0a0a0a] hover:text-[#0a0a0a]"
+          >
+            <option value="ALL">Toutes les audiences</option>
+            {allAudiences.map((a) => (
+              <option key={a} value={a}>{a}</option>
+            ))}
+          </select>
+          {/* Chevron icon */}
+          <span className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+              <path d="M2 3.5l3 3 3-3" stroke="#a3a3a3" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </span>
+        </div>
+
+        {/* Reset */}
+        {hasFilters && (
+          <button
+            onClick={resetFilters}
+            className="flex items-center gap-1 text-xs text-[#737373] hover:text-[#0a0a0a] transition-colors ml-auto"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+            </svg>
+            Réinitialiser les filtres
+          </button>
+        )}
+      </div>
+
+      {/* ── Theme table ─────────────────────────────────────────────────────── */}
       <div className="bg-white border border-[#e5e5e5] rounded-[6px]">
+
+        {/* Table header */}
         <div className="px-5 py-4 border-b border-[#e5e5e5] flex items-center justify-between">
           <h2 className="text-sm font-semibold text-[#0a0a0a]">Thématiques</h2>
           {!loading && (
             <span className="text-xs text-[#a3a3a3]">
-              {filteredRows.length} thème{filteredRows.length !== 1 ? 's' : ''}
+              {totalRows} thème{totalRows !== 1 ? 's' : ''}
               {emails?.count === 0 && (
-                <span className="ml-2 text-[#a3a3a3]">— emails non disponibles (scope manquant)</span>
+                <span className="ml-2">— emails non disponibles (scope manquant)</span>
               )}
             </span>
           )}
@@ -263,9 +342,10 @@ export default function DashboardPage() {
               ))}
             </tr>
           </thead>
+
           <tbody>
             {loading ? (
-              Array.from({ length: 5 }).map((_, i) => (
+              Array.from({ length: 8 }).map((_, i) => (
                 <tr key={i} className="border-b border-[#f5f5f5] last:border-0">
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-40" /></td>
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-24" /></td>
@@ -275,21 +355,21 @@ export default function DashboardPage() {
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-14" /></td>
                 </tr>
               ))
-            ) : filteredRows.length === 0 ? (
+            ) : pageRows.length === 0 ? (
               <tr>
                 <td colSpan={6} className="px-5 py-10 text-center text-sm text-[#a3a3a3]">
-                  {search.trim()
-                    ? 'Aucun résultat pour cette recherche.'
+                  {hasFilters
+                    ? 'Aucun résultat pour ces filtres.'
                     : emails?.count === 0
                     ? 'Les emails individuels nécessitent le scope "content" dans l\'app HubSpot.'
                     : 'Aucun email sur cette période.'}
                 </td>
               </tr>
             ) : (
-              filteredRows.map((row, i) => {
-                const typeLabel = EMAIL_TYPE_LABELS[row.type as EmailType] ?? row.type
+              pageRows.map((row, i) => {
+                const typeLabel    = EMAIL_TYPE_LABELS[row.type as EmailType] ?? row.type
                 const clickRateStr = fmtRate(row.totalClicks, row.totalDelivered)
-                const openRateStr = fmtRate(row.totalOpens, row.totalDelivered)
+                const openRateStr  = fmtRate(row.totalOpens,  row.totalDelivered)
                 return (
                   <tr
                     key={`${row.theme}-${i}`}
@@ -299,9 +379,7 @@ export default function DashboardPage() {
                       <span className="flex items-center gap-2">
                         {row.theme}
                         {row.isABTest && (
-                          <span className="text-[10px] font-semibold text-[#737373] border border-[#e5e5e5] px-1.5 py-0.5 rounded-[2px]">
-                            A/B
-                          </span>
+                          <span className="text-[10px] font-semibold text-[#737373] border border-[#e5e5e5] px-1.5 py-0.5 rounded-[2px]">A/B</span>
                         )}
                       </span>
                     </td>
@@ -311,17 +389,13 @@ export default function DashboardPage() {
                     <td className="px-5 py-3.5">
                       <span className="text-[#0a0a0a] tabular-nums">{fmtNumber(row.totalClicks)}</span>
                       {clickRateStr && (
-                        <span className="block text-[10px] text-[#a3a3a3] tabular-nums mt-0.5">
-                          {clickRateStr}
-                        </span>
+                        <span className="block text-[10px] text-[#a3a3a3] tabular-nums mt-0.5">{clickRateStr}</span>
                       )}
                     </td>
                     <td className="px-5 py-3.5">
                       <span className="text-[#0a0a0a] tabular-nums">{fmtNumber(row.totalOpens)}</span>
                       {openRateStr && (
-                        <span className="block text-[10px] text-[#a3a3a3] tabular-nums mt-0.5">
-                          {openRateStr}
-                        </span>
+                        <span className="block text-[10px] text-[#a3a3a3] tabular-nums mt-0.5">{openRateStr}</span>
                       )}
                     </td>
                   </tr>
@@ -330,6 +404,45 @@ export default function DashboardPage() {
             )}
           </tbody>
         </table>
+
+        {/* ── Pagination ──────────────────────────────────────────────────────── */}
+        {!loading && totalRows > PAGE_SIZE && (
+          <div className="px-5 py-3 border-t border-[#e5e5e5] flex items-center justify-between">
+            <button
+              onClick={() => setPage((p) => p - 1)}
+              disabled={!hasPrev}
+              className={`flex items-center gap-1.5 text-sm font-medium transition-colors ${
+                hasPrev
+                  ? 'text-[#0a0a0a] hover:text-[#737373]'
+                  : 'text-[#d4d4d4] cursor-not-allowed'
+              }`}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                <path d="M8.5 3L4.5 7l4 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Précédent
+            </button>
+
+            <span className="text-xs text-[#737373]">
+              {rangeStart}–{rangeEnd} sur {totalRows} thème{totalRows !== 1 ? 's' : ''}
+            </span>
+
+            <button
+              onClick={() => setPage((p) => p + 1)}
+              disabled={!hasNext}
+              className={`flex items-center gap-1.5 text-sm font-medium transition-colors ${
+                hasNext
+                  ? 'text-[#0a0a0a] hover:text-[#737373]'
+                  : 'text-[#d4d4d4] cursor-not-allowed'
+              }`}
+            >
+              Suivant
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                <path d="M5.5 3L9.5 7l-4 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          </div>
+        )}
       </div>
 
     </div>

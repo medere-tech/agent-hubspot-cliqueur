@@ -1,9 +1,35 @@
+import { unstable_cache } from 'next/cache'
 import { auth } from '@/lib/auth'
 import { getCampaigns, getMarketingEmails } from '@/lib/hubspot'
+import type { MarketingEmail } from '@/lib/hubspot'
 import { NextRequest, NextResponse } from 'next/server'
 
 const VALID_DAYS = [7, 28, 90, 360] as const
 type ValidDays = (typeof VALID_DAYS)[number]
+
+/**
+ * Cache the full aggregated result (campaigns + emails) for 5 min.
+ * Auth check still runs on every request; only the HubSpot data is cached.
+ * On Vercel, the first visitor pays the cost — all subsequent visitors
+ * within the 5-min window get an instant response.
+ */
+const getCachedData = unstable_cache(
+  async (days: ValidDays) => {
+    const [campaigns, emails] = await Promise.all([
+      getCampaigns(days),
+      getMarketingEmails(days).catch((err: unknown): MarketingEmail[] => {
+        console.warn(
+          '[api/hubspot/campaigns] getMarketingEmails unavailable:',
+          err instanceof Error ? err.message : err
+        )
+        return []
+      }),
+    ])
+    return { campaigns, emails }
+  },
+  ['hubspot-data'],
+  { revalidate: 300, tags: ['hubspot'] }
+)
 
 export async function GET(req: NextRequest) {
   const session = await auth()
@@ -18,27 +44,7 @@ export async function GET(req: NextRequest) {
     : 90
 
   try {
-    const [campaigns, emails] = await Promise.all([
-      getCampaigns(days),
-      // getMarketingEmails may 403 if the content scope is missing —
-      // we catch it individually so it doesn't fail the whole request.
-      getMarketingEmails(days).catch((err: unknown) => {
-        console.warn(
-          '[api/hubspot/campaigns] getMarketingEmails unavailable:',
-          err instanceof Error ? err.message : err
-        )
-        return []
-      }),
-    ])
-
-    console.log('[api/hubspot/campaigns] premier email stats:', JSON.stringify({
-      id: emails[0]?.id,
-      name: emails[0]?.name,
-      clicks: (emails[0] as { clicks?: number })?.clicks,
-      opens: (emails[0] as { opens?: number })?.opens,
-      delivered: (emails[0] as { delivered?: number })?.delivered,
-    }))
-
+    const { campaigns, emails } = await getCachedData(days)
     return NextResponse.json({
       days,
       campaigns: { count: campaigns.length, data: campaigns },

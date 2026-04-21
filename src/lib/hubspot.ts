@@ -380,7 +380,19 @@ export async function getCampaigns(days: 7 | 28 | 90 | 360): Promise<Campaign[]>
 
 // ─── getMarketingEmails ───────────────────────────────────────────────────────
 
-const DETAIL_BATCH_SIZE = 10
+/**
+ * NOTE — architecture des appels HubSpot :
+ *  - GET /email/public/v1/campaigns?limit=100 (liste) retourne uniquement
+ *    id, lastUpdatedTime, appId, appName — sans name ni counters.
+ *  - GET /email/public/v1/campaigns/{id} (detail) est obligatoire pour
+ *    obtenir name + counters.click + counters.open + counters.delivered.
+ *
+ * On minimise le nombre de batches séquentiels en passant de 10 à 50
+ * appels parallèles par batch (~5 batches au lieu de ~24 pour 250 emails).
+ * Le { revalidate: 300 } sur chaque appel assure que les appels suivants
+ * dans la même fenêtre de 5 min sont servis depuis le cache Next.js.
+ */
+const DETAIL_BATCH_SIZE = 50
 
 /**
  * Fetch sent email campaigns from HubSpot v1 API with real click/open stats.
@@ -388,11 +400,8 @@ const DETAIL_BATCH_SIZE = 10
  * Strategy:
  *  1. List /email/public/v1/campaigns (sorted by lastUpdatedTime DESC) until
  *     lastUpdatedTime drops below the since threshold — early termination.
- *  2. Batch-fetch campaign details (10 at a time) to get name + counters.
+ *  2. Batch-fetch campaign details (50 at a time) to get name + counters.
  *  3. Re-filter by scheduledAt >= since for accurate date scoping.
- *
- * Requires scope: crm.lists.read (v1 campaigns are accessible with standard
- * marketing scopes; no extra scope needed beyond the token's existing access).
  */
 export async function getMarketingEmails(
   days: 7 | 28 | 90 | 360
