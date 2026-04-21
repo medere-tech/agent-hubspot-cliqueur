@@ -9,3 +9,7 @@ git push
 git add .
 git commit -m "feat: Ajout pagination, amélioration des performations et filtres premiums"
 git push
+
+git add .
+git commit -m "feat: Pagination par 10x, amélioration des performations et pages manquantes"
+git push
