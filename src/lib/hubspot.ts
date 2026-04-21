@@ -495,3 +495,117 @@ export async function getMarketingEmails(
 
   return emails
 }
+
+// ─── getTopClickers ───────────────────────────────────────────────────────────
+
+export interface TopClicker {
+  contactId: number | null
+  emailAddress: string
+  totalClicks: number
+  clickedThemes: string[]
+  audiences: string[]
+}
+
+interface HubSpotV1Recipient {
+  contactId?: number
+  emailAddress: string
+  /** Number of times this contact clicked in this campaign. May be absent → default 1. */
+  clickCount?: number
+}
+
+interface HubSpotV1RecipientsResponse {
+  recipients: HubSpotV1Recipient[]
+  hasMore: boolean
+  /** Numeric offset for the next page */
+  offset?: number
+  total?: number
+}
+
+/**
+ * Paginate through all CLICKED recipients for one campaign.
+ * Caps at 500 recipients per email to avoid runaway pagination.
+ */
+async function getEmailRecipients(emailId: string): Promise<HubSpotV1Recipient[]> {
+  const all: HubSpotV1Recipient[] = []
+  let offset: number | undefined
+  const MAX_PER_EMAIL = 500
+
+  do {
+    const params: Record<string, string> = { status: 'CLICKED', limit: '100' }
+    if (offset !== undefined) params.offset = String(offset)
+
+    const page = await hubspotFetch<HubSpotV1RecipientsResponse>(
+      `/email/public/v1/campaigns/${emailId}/recipients`,
+      params,
+      { revalidate: 300 }
+    )
+
+    all.push(...page.recipients)
+    offset = page.hasMore && page.offset !== undefined ? page.offset : undefined
+  } while (offset !== undefined && all.length < MAX_PER_EMAIL)
+
+  return all
+}
+
+/**
+ * Fetch top 100 contacts by total clicks across all sent emails in the period.
+ *
+ * Strategy:
+ *  1. Get all email campaigns via getMarketingEmails(days).
+ *  2. Fetch CLICKED recipients for each email in batches of 5.
+ *  3. Aggregate by emailAddress: sum clicks, collect unique themes + audiences.
+ *  4. Sort descending by totalClicks, return top 100.
+ */
+export async function getTopClickers(days: 7 | 28 | 90 | 360): Promise<TopClicker[]> {
+  const emails = await getMarketingEmails(days)
+
+  const map = new Map<string, TopClicker>()
+
+  // Process 5 emails at a time to stay within HubSpot rate limits
+  const RECIPIENTS_BATCH_SIZE = 5
+
+  for (let i = 0; i < emails.length; i += RECIPIENTS_BATCH_SIZE) {
+    const batch = emails.slice(i, i + RECIPIENTS_BATCH_SIZE)
+
+    const batchResults = await Promise.all(
+      batch.map(async (email) => {
+        try {
+          const recipients = await getEmailRecipients(email.id)
+          return { email, recipients }
+        } catch {
+          return { email, recipients: [] as HubSpotV1Recipient[] }
+        }
+      })
+    )
+
+    for (const { email, recipients } of batchResults) {
+      for (const r of recipients) {
+        const key = r.emailAddress.toLowerCase()
+        const clicks = r.clickCount ?? 1
+        const existing = map.get(key)
+
+        if (existing) {
+          existing.totalClicks += clicks
+          if (!existing.clickedThemes.includes(email.theme)) {
+            existing.clickedThemes.push(email.theme)
+          }
+          for (const a of email.audiences) {
+            if (!existing.audiences.includes(a)) existing.audiences.push(a)
+          }
+        } else {
+          map.set(key, {
+            contactId: r.contactId ?? null,
+            emailAddress: r.emailAddress,
+            totalClicks: clicks,
+            clickedThemes: [email.theme],
+            audiences: [...email.audiences],
+          })
+        }
+      }
+    }
+  }
+
+  return [...map.values()]
+    .sort((a, b) => b.totalClicks - a.totalClicks)
+    .slice(0, 100)
+}
