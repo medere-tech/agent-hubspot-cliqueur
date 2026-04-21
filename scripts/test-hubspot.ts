@@ -9,22 +9,30 @@ if (!token) {
   process.exit(1)
 }
 
-async function main() {
-  const url = 'https://api.hubapi.com/marketing/v3/campaigns?limit=100&properties=hs_name,hs_startdate,hs_enddate'
-  console.log('URL :', url)
+async function testEndpoint(label: string, url: string) {
+  console.log(`\n${'='.repeat(60)}`)
+  console.log(`[${label}] ${url}`)
+  console.log('='.repeat(60))
 
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
   })
 
   console.log('Status :', res.status)
-  const data = await res.json() as { total?: number; results: Array<{ id: string; properties: { hs_name?: string }; updatedAt: string }> }
-
-  console.log('Total :', data.total ?? data.results.length)
-  console.log('\nCampagnes :')
-  for (const c of data.results) {
-    console.log(`  [${c.updatedAt.slice(0, 10)}] ${c.properties.hs_name ?? '(sans nom)'}`)
+  const body = await res.text()
+  try {
+    const json = JSON.parse(body)
+    console.log('Body (JSON) :')
+    console.log(JSON.stringify(json, null, 2))
+  } catch {
+    console.log('Body (raw) :')
+    console.log(body)
   }
+}
+
+async function main() {
+  await testEndpoint('marketing/v3/emails', 'https://api.hubapi.com/marketing/v3/emails?limit=5')
+  await testEndpoint('cms/v3/emails', 'https://api.hubapi.com/cms/v3/emails?limit=5')
 }
 
 main()

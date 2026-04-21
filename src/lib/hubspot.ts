@@ -1,16 +1,28 @@
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type CampaignType = 'CV' | 'PRES' | 'ELEARNING' | 'AUTRE'
-export type CampaignAudience = 'MG' | 'CD' | 'MK' | 'PROSPECT' | 'CLIENTS' | 'AUTRE'
+export type EmailType = 'CV' | 'PRES' | 'EL' | 'WEBINAIRE' | 'NEWSLETTER' | 'AUTRE'
+export type Qualifier = 'prospect' | 'client' | null
+export type SubType = 'confirmation' | 'jour-j' | 'j-2' | 'replay' | null
+
+export const EMAIL_TYPE_LABELS: Record<EmailType, string> = {
+  CV: 'Classe virtuelle',
+  PRES: 'Présentiel',
+  EL: 'E-learning',
+  WEBINAIRE: 'Webinaire',
+  NEWSLETTER: 'Newsletter',
+  AUTRE: 'Autre',
+}
 
 export interface ParsedCampaignName {
-  type: CampaignType
-  audience: CampaignAudience
+  type: EmailType
+  audiences: string[]
+  qualifier: Qualifier
   edition: string | null
   theme: string
   isABTest: boolean
   envoi: number | null
   periode: string | null
+  subType: SubType
 }
 
 export interface HubSpotCampaignRaw {
@@ -19,20 +31,6 @@ export interface HubSpotCampaignRaw {
     hs_name?: string | null
     hs_start_date?: string | null
     hs_end_date?: string | null
-  }
-  createdAt: string
-  updatedAt: string
-}
-
-export interface HubSpotEmailRaw {
-  id: string
-  properties: {
-    hs_name?: string | null
-    hs_subject?: string | null
-    hs_send_date?: string | null
-    hs_email_status?: string | null
-    hs_opens_count?: string | null
-    hs_clicks_count?: string | null
   }
   createdAt: string
   updatedAt: string
@@ -51,12 +49,17 @@ export interface MarketingEmail extends ParsedCampaignName {
   id: string
   name: string
   subject: string | null
-  sendDate: string | null
+  /** ISO date de l'envoi (scheduledAt v1) */
+  sentAt: string | null
   status: string | null
-  opensCount: number | null
-  clicksCount: number | null
-  createdAt: string
-  updatedAt: string
+  clicks: number
+  opens: number
+  delivered: number
+  sent: number
+  /** Taux d'ouverture en % (opens / delivered * 100), null si delivered = 0 */
+  openRate: number | null
+  /** Taux de clic en % (clicks / delivered * 100), null si delivered = 0 */
+  clickRate: number | null
 }
 
 interface HubSpotListResponse<T> {
@@ -66,6 +69,46 @@ interface HubSpotListResponse<T> {
     next?: {
       after: string
     }
+  }
+}
+
+// v1 email campaigns API types
+interface HubSpotV1CampaignListItem {
+  id: number
+  lastUpdatedTime: number
+  appId: number
+  appName: string
+}
+
+interface HubSpotV1CampaignListResponse {
+  campaigns: HubSpotV1CampaignListItem[]
+  hasMore: boolean
+  offset?: string
+}
+
+interface HubSpotV1CampaignDetail {
+  id: number
+  groupId?: number
+  contentId?: number
+  appId?: number
+  appName?: string
+  name?: string
+  subject?: string
+  /** Unix timestamp ms — date d'envoi planifiée */
+  scheduledAt?: number
+  type?: string
+  subType?: string
+  processingState?: string
+  counters?: {
+    sent?: number
+    delivered?: number
+    click?: number
+    open?: number
+    bounce?: number
+    unsubscribed?: number
+    dropped?: number
+    spamreport?: number
+    deferred?: number
   }
 }
 
@@ -112,78 +155,181 @@ async function hubspotFetch<T>(
   return res.json() as Promise<T>
 }
 
+// ─── Audience detection ───────────────────────────────────────────────────────
+
+const KNOWN_AUDIENCES = ['MG', 'CD', 'MK', 'SF', 'PSY', 'PED', 'GYN', 'PLURIPRO']
+
+/**
+ * Scan a raw email name for known audience codes using word boundaries.
+ * Returns ['AUTRE'] if none detected.
+ */
+function detectAudiencesFromName(name: string): string[] {
+  const upper = name.toUpperCase()
+  const found = KNOWN_AUDIENCES.filter((a) => new RegExp(`\\b${a}\\b`).test(upper))
+  return found.length > 0 ? found : ['AUTRE']
+}
+
 // ─── parseEmailName ───────────────────────────────────────────────────────────
 
 /**
- * Parse a HubSpot campaign name following Médéré naming convention:
- * [TYPE] - [AUDIENCE] - [EDITION?] - [THEME] (Xème envoi MMAAAA)
+ * Parse a HubSpot email name following Médéré naming conventions.
  *
- * Examples:
- *   "(A) CV - MG - Sommeil (5ème envoi 032026)"
- *   "PRES - CD - RM7 - Chirurgie guidée (2eme envoi 032026)"
- *   "CV - MK - Pathologies de l'épaule (3eme envoi 032026)"
- *   "PRES - MG (prospect) - RM7 - ECG (2eme envoi 032026)"
+ * Pattern 1 — DPC/Formations:
+ *   [(A) ]CV|PRES|EL - AUDIENCE[/AUDIENCE][(qualificateur)] [ - EDITION] - THEME [(Xème envoi MMAAAA)]
+ *
+ * Pattern 2 — Webinaires:
+ *   AAAAMM_Webinaire · THEME [ · SOUS-TYPE]
+ *
+ * Pattern 3 — Newsletters:
+ *   Newsletter #N · AAAAMM · AUDIENCE
+ *
+ * Pattern 4 — Autres / non reconnus:
+ *   AAAAMM_NOM ou format libre
  */
 export function parseEmailName(name: string): ParsedCampaignName {
-  let working = name.trim()
+  const trimmed = name.trim()
 
-  // 1. A/B test prefix
-  const isABTest = /^\(A\)/i.test(working)
-  if (isABTest) {
-    working = working.replace(/^\(A\)\s*/i, '').trim()
+  // ── Pattern 2 — Webinaire ────────────────────────────────────────────────
+  if (/webinaire/i.test(trimmed) && trimmed.includes('·')) {
+    const parts = trimmed.split('·').map((p) => p.trim())
+    // parts[0] = "2603_Webinaire" | "Webinaire", parts[1] = theme, parts[2] = sous-type
+    const rawTheme = parts[1] ?? ''
+    const rawSubType = (parts[2] ?? '').toLowerCase()
+
+    let subType: SubType = null
+    if (rawSubType.includes('confirmation')) subType = 'confirmation'
+    else if (rawSubType.includes('jour j') || rawSubType === 'jour j') subType = 'jour-j'
+    else if (rawSubType.includes('j-2')) subType = 'j-2'
+    else if (rawSubType.includes('replay')) subType = 'replay'
+
+    const theme = rawTheme
+      ? rawTheme.charAt(0).toUpperCase() + rawTheme.slice(1)
+      : 'Webinaire'
+
+    return {
+      type: 'WEBINAIRE',
+      audiences: detectAudiencesFromName(trimmed),
+      qualifier: null,
+      edition: null,
+      theme,
+      isABTest: false,
+      envoi: null,
+      periode: null,
+      subType,
+    }
   }
 
-  // 2. Extract envoi + periode from end
-  let envoi: number | null = null
-  let periode: string | null = null
+  // ── Pattern 3 — Newsletter ───────────────────────────────────────────────
+  if (/^newsletter/i.test(trimmed)) {
+    // "Newsletter #21 · 260308 · CD" — audience is the last ·-segment
+    const parts = trimmed.split('·').map((p) => p.trim())
+    const lastPart = parts[parts.length - 1] ?? ''
+    const audiences =
+      lastPart && !/^\d+$/.test(lastPart)
+        ? [lastPart.toUpperCase()]
+        : detectAudiencesFromName(trimmed)
 
-  const envoiMatch = working.match(
-    /\((\d+)\s*[eè](?:me|re|r)?\s+envoi\s+(\d{6})\)\s*$/i
-  )
-  if (envoiMatch) {
-    envoi = parseInt(envoiMatch[1], 10)
-    periode = envoiMatch[2]
-    working = working.slice(0, envoiMatch.index).trim()
+    return {
+      type: 'NEWSLETTER',
+      audiences,
+      qualifier: null,
+      edition: null,
+      theme: 'Newsletter',
+      isABTest: false,
+      envoi: null,
+      periode: null,
+      subType: null,
+    }
   }
 
-  // 3. Split by ' - '
-  const parts = working.split(/\s+-\s+/).map((p) => p.trim()).filter(Boolean)
+  // ── Pattern 1 — DPC/Formations (CV | PRES | EL) ──────────────────────────
+  const isDPC = /^(?:\(A\)\s*)?(?:CV|PRES|EL)\s*-/i.test(trimmed)
 
-  // 4. Type (first segment)
-  const rawType = parts[0]?.toUpperCase() ?? ''
-  let type: CampaignType = 'AUTRE'
-  if (rawType === 'CV') type = 'CV'
-  else if (rawType === 'PRES') type = 'PRES'
-  else if (rawType === 'ELEARNING' || rawType === 'E-LEARNING') type = 'ELEARNING'
+  if (isDPC) {
+    let working = trimmed
 
-  // 5. Audience (second segment — may contain sub-segment like "MG (prospect)")
-  const rawAudience = parts[1] ?? ''
-  const audienceBase = rawAudience.replace(/\s*\([^)]+\)/g, '').trim().toUpperCase()
-  const qualifierMatch = rawAudience.match(/\(([^)]+)\)/i)
-  const qualifier = qualifierMatch?.[1]?.trim().toUpperCase() ?? ''
+    // 1. A/B test prefix
+    const isABTest = /^\(A\)\s*/i.test(working)
+    if (isABTest) working = working.replace(/^\(A\)\s*/i, '').trim()
 
-  let audience: CampaignAudience = 'AUTRE'
-  if (audienceBase === 'MG') audience = 'MG'
-  else if (audienceBase === 'CD') audience = 'CD'
-  else if (audienceBase === 'MK') audience = 'MK'
-  else if (audienceBase === 'PROSPECT' || qualifier === 'PROSPECT') audience = 'PROSPECT'
-  else if (audienceBase === 'CLIENTS' || qualifier === 'CLIENTS') audience = 'CLIENTS'
+    // 2. Extract envoi + periode from end — handles "3ème envoi 032026" and "3ème envoi - 032026"
+    let envoi: number | null = null
+    let periode: string | null = null
+    const envoiMatch = working.match(
+      /\((\d+)\s*[eè](?:me|re|r)?\s+envoi\s*(?:-\s*)?(\d{6})\)\s*$/i
+    )
+    if (envoiMatch) {
+      envoi = parseInt(envoiMatch[1], 10)
+      periode = envoiMatch[2]
+      working = working.slice(0, envoiMatch.index).trim()
+    }
 
-  // 6. Edition + theme from remaining segments
-  const EDITION_RE = /^[A-Z]{1,4}\d+$/
-  const remaining = parts.slice(2)
+    // 3. Split by " - "
+    const parts = working
+      .split(/\s+-\s+/)
+      .map((p) => p.trim())
+      .filter(Boolean)
 
-  let edition: string | null = null
-  let themeStartIndex = 0
+    // 4. Type (first segment)
+    const rawType = parts[0]?.toUpperCase() ?? ''
+    const type: EmailType =
+      rawType === 'CV' ? 'CV' : rawType === 'PRES' ? 'PRES' : rawType === 'EL' ? 'EL' : 'AUTRE'
 
-  if (remaining.length > 0 && EDITION_RE.test(remaining[0])) {
-    edition = remaining[0]
-    themeStartIndex = 1
+    // 5. Audience segment: "MG/PSY/PED" | "CD (Clients)" | "GYN/SF"
+    const audienceSegment = parts[1] ?? ''
+
+    let qualifier: Qualifier = null
+    const qualMatch = audienceSegment.match(/\((clients?|prospects?)\)/i)
+    if (qualMatch) {
+      qualifier = qualMatch[1].toLowerCase().startsWith('client') ? 'client' : 'prospect'
+    }
+
+    const cleanedAudience = audienceSegment.replace(/\s*\([^)]+\)/g, '').trim()
+    const audiences = cleanedAudience
+      .split('/')
+      .map((a) => a.trim().toUpperCase())
+      .filter(Boolean)
+
+    // 6. Edition + theme from remaining segments
+    const remaining = parts.slice(2)
+    let edition: string | null = null
+    let theme = 'Sans thème'
+
+    if (remaining.length > 0) {
+      // Edition can be "RM7" alone or "RM8 (Agressivité)" — theme in parens
+      const editionMatch = remaining[0].match(/^(RM\d+)(?:\s+\(([^)]+)\))?$/)
+      if (editionMatch) {
+        edition = editionMatch[1]
+        const themeFromEdition = editionMatch[2] ?? null
+        const afterEdition = remaining.slice(1).join(' - ')
+        const raw = themeFromEdition ?? afterEdition
+        theme = raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : 'Sans thème'
+      } else {
+        const raw = remaining.join(' - ')
+        theme = raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : 'Sans thème'
+      }
+    }
+
+    return { type, audiences, qualifier, edition, theme, isABTest, envoi, periode, subType: null }
   }
 
-  const theme = remaining.slice(themeStartIndex).join(' - ').trim() || 'Sans thème'
+  // ── Pattern 4 — Autre ────────────────────────────────────────────────────
+  // Remove AAAAMM_ prefix if present, replace underscores with spaces
+  const withoutPrefix = trimmed.replace(/^\d{4}_/, '')
+  const raw = withoutPrefix.replace(/_/g, ' ').trim()
+  const theme = raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : trimmed
 
-  return { type, audience, edition, theme, isABTest, envoi, periode }
+  return {
+    type: 'AUTRE',
+    audiences: detectAudiencesFromName(trimmed),
+    qualifier: null,
+    edition: null,
+    theme,
+    isABTest: false,
+    envoi: null,
+    periode: null,
+    subType: null,
+  }
 }
 
 // ─── getCampaigns ─────────────────────────────────────────────────────────────
@@ -234,61 +380,109 @@ export async function getCampaigns(days: 7 | 28 | 90 | 360): Promise<Campaign[]>
 
 // ─── getMarketingEmails ───────────────────────────────────────────────────────
 
+const DETAIL_BATCH_SIZE = 10
+
 /**
- * Fetch individual marketing email sends from HubSpot.
- * Requires scope: content
- * Returns empty array and logs a warning if the scope is missing (403).
+ * Fetch sent email campaigns from HubSpot v1 API with real click/open stats.
+ *
+ * Strategy:
+ *  1. List /email/public/v1/campaigns (sorted by lastUpdatedTime DESC) until
+ *     lastUpdatedTime drops below the since threshold — early termination.
+ *  2. Batch-fetch campaign details (10 at a time) to get name + counters.
+ *  3. Re-filter by scheduledAt >= since for accurate date scoping.
+ *
+ * Requires scope: crm.lists.read (v1 campaigns are accessible with standard
+ * marketing scopes; no extra scope needed beyond the token's existing access).
  */
 export async function getMarketingEmails(
   days: 7 | 28 | 90 | 360
 ): Promise<MarketingEmail[]> {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
-  const sinceIso = since.toISOString()
+  const sinceMs = since.getTime()
 
-  const EMAIL_PROPERTIES =
-    'hs_name,hs_subject,hs_send_date,hs_email_status,hs_opens_count,hs_clicks_count'
+  // ── Step 1 : collect campaign IDs from list endpoint ──────────────────────
+  const ids: number[] = []
+  let offset: string | undefined
+  let keepPaging = true
 
-  const allRaw: HubSpotEmailRaw[] = []
-  let after: string | undefined
+  while (keepPaging) {
+    const params: Record<string, string> = { limit: '100' }
+    if (offset) params.offset = offset
 
-  do {
-    const params: Record<string, string> = {
-      limit: '50',
-      properties: EMAIL_PROPERTIES,
-      ...(after ? { after } : {}),
-    }
-
-    const page = await hubspotFetch<HubSpotListResponse<HubSpotEmailRaw>>(
-      '/marketing/v3/emails',
+    const page = await hubspotFetch<HubSpotV1CampaignListResponse>(
+      '/email/public/v1/campaigns',
       params,
       { revalidate: 300 }
     )
 
-    allRaw.push(...page.results)
-    after = page.paging?.next?.after
-  } while (after)
-
-  // Filter on send date if available, otherwise fall back to updatedAt
-  const filtered = allRaw.filter((e) => {
-    const date = e.properties.hs_send_date ?? e.updatedAt
-    return date >= sinceIso
-  })
-
-  return filtered.map((e) => {
-    const name = e.properties.hs_name?.trim() || 'Sans nom'
-    const opensRaw = e.properties.hs_opens_count
-    const clicksRaw = e.properties.hs_clicks_count
-    return {
-      id: e.id,
-      name,
-      subject: e.properties.hs_subject ?? null,
-      sendDate: e.properties.hs_send_date ?? null,
-      status: e.properties.hs_email_status ?? null,
-      opensCount: opensRaw != null ? parseInt(opensRaw, 10) : null,
-      clicksCount: clicksRaw != null ? parseInt(clicksRaw, 10) : null,
-      createdAt: e.createdAt,
-      updatedAt: e.updatedAt,
-      ...parseEmailName(name),
+    for (const c of page.campaigns) {
+      if (c.lastUpdatedTime < sinceMs) {
+        // List is sorted DESC — everything after this point is older
+        keepPaging = false
+        break
+      }
+      ids.push(c.id)
     }
-  })
+
+    if (!page.hasMore) keepPaging = false
+    offset = page.offset
+  }
+
+  // ── Step 2 : batch-fetch details ──────────────────────────────────────────
+  const details: HubSpotV1CampaignDetail[] = []
+  for (let i = 0; i < ids.length; i += DETAIL_BATCH_SIZE) {
+    const batch = ids.slice(i, i + DETAIL_BATCH_SIZE)
+    const batchDetails = await Promise.all(
+      batch.map((id) =>
+        hubspotFetch<HubSpotV1CampaignDetail>(
+          `/email/public/v1/campaigns/${id}`,
+          {},
+          { revalidate: 300 }
+        ).catch(() => null)
+      )
+    )
+    for (const d of batchDetails) {
+      if (d !== null) details.push(d)
+    }
+  }
+
+  // ── Step 3 : map to MarketingEmail ────────────────────────────────────────
+  const emails: MarketingEmail[] = []
+
+  for (const detail of details) {
+    // Re-filter by scheduledAt when available (more accurate than lastUpdatedTime)
+    if (detail.scheduledAt && detail.scheduledAt > 0 && detail.scheduledAt < sinceMs) continue
+
+    const name = (detail.name ?? '').trim() || 'Sans nom'
+    const parsed = parseEmailName(name)
+
+    const clicks = detail.counters?.click ?? 0
+    const opens = detail.counters?.open ?? 0
+    const delivered = detail.counters?.delivered ?? 0
+    const sent = detail.counters?.sent ?? 0
+
+    const openRate = delivered > 0 ? (opens / delivered) * 100 : null
+    const clickRate = delivered > 0 ? (clicks / delivered) * 100 : null
+
+    // A/B test: detected by appName OR by (A) prefix in name
+    const isABTest = detail.appName === 'AbBatch' || parsed.isABTest
+
+    emails.push({
+      id: String(detail.id),
+      name,
+      subject: detail.subject ?? null,
+      sentAt: detail.scheduledAt ? new Date(detail.scheduledAt).toISOString() : null,
+      status: detail.processingState ?? detail.type ?? null,
+      clicks,
+      opens,
+      delivered,
+      sent,
+      openRate,
+      clickRate,
+      ...parsed,
+      isABTest,
+    })
+  }
+
+  return emails
 }

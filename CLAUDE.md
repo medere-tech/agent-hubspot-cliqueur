@@ -132,4 +132,4 @@ npm run lint         # Vérifier le code
 - **Client final** : Arnaud (marketing automation chez Médéré)
 - **Médéré** : organisme de formation médicale et dentaire certifié DPC
 - **Objectif** : segmenter les contacts selon leur appétence thématique pour personnaliser les campagnes email
-- **L'app doit être durable** : si Arnaud quitte l'entreprise, son remplaçant doit pouvoir l'utiliser sans formation
+- **L'app doit être durable** : si Arnaud quitte l'entreprise, son remplaçant doit pouvoir l'utiliser sans formation-²   VB N?

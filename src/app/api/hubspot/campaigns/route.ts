@@ -5,8 +5,6 @@ import { NextRequest, NextResponse } from 'next/server'
 const VALID_DAYS = [7, 28, 90, 360] as const
 type ValidDays = (typeof VALID_DAYS)[number]
 
-const CACHE_TTL = 300 // 5 minutes
-
 export async function GET(req: NextRequest) {
   const session = await auth()
   if (!session) {
@@ -33,18 +31,19 @@ export async function GET(req: NextRequest) {
       }),
     ])
 
-    return NextResponse.json(
-      {
-        days,
-        campaigns: { count: campaigns.length, data: campaigns },
-        emails: { count: emails.length, data: emails },
-      },
-      {
-        headers: {
-          'Cache-Control': `private, max-age=${CACHE_TTL}`,
-        },
-      }
-    )
+    console.log('[api/hubspot/campaigns] premier email stats:', JSON.stringify({
+      id: emails[0]?.id,
+      name: emails[0]?.name,
+      clicks: (emails[0] as { clicks?: number })?.clicks,
+      opens: (emails[0] as { opens?: number })?.opens,
+      delivered: (emails[0] as { delivered?: number })?.delivered,
+    }))
+
+    return NextResponse.json({
+      days,
+      campaigns: { count: campaigns.length, data: campaigns },
+      emails: { count: emails.length, data: emails },
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     console.error('[api/hubspot/campaigns]', message)

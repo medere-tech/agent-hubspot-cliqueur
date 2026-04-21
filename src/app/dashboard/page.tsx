@@ -1,6 +1,7 @@
 'use client'
 
-import type { Campaign, MarketingEmail } from '@/lib/hubspot'
+import type { Campaign, MarketingEmail, EmailType } from '@/lib/hubspot'
+import { EMAIL_TYPE_LABELS } from '@/lib/hubspot'
 import { useCallback, useEffect, useState } from 'react'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -18,12 +19,22 @@ interface ThemeRow {
   type: string
   audiences: string[]
   emailCount: number
-  totalClicks: number | null
-  totalOpens: number | null
+  totalClicks: number
+  totalOpens: number
+  totalDelivered: number
   isABTest: boolean
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function fmtNumber(n: number): string {
+  return n.toLocaleString('fr-FR')
+}
+
+function fmtRate(numerator: number, denominator: number): string | null {
+  if (denominator === 0) return null
+  return (numerator / denominator * 100).toFixed(1) + '\u202f%'
+}
 
 function computeThemeRows(emails: MarketingEmail[]): ThemeRow[] {
   const map = new Map<string, ThemeRow>()
@@ -33,26 +44,30 @@ function computeThemeRows(emails: MarketingEmail[]): ThemeRow[] {
     const existing = map.get(key)
     if (existing) {
       existing.emailCount++
-      if (!existing.audiences.includes(e.audience)) existing.audiences.push(e.audience)
+      for (const a of e.audiences) {
+        if (!existing.audiences.includes(a)) existing.audiences.push(a)
+      }
       if (e.isABTest) existing.isABTest = true
-      if (e.clicksCount != null)
-        existing.totalClicks = (existing.totalClicks ?? 0) + e.clicksCount
-      if (e.opensCount != null)
-        existing.totalOpens = (existing.totalOpens ?? 0) + e.opensCount
+      existing.totalClicks += e.clicks
+      existing.totalOpens += e.opens
+      existing.totalDelivered += e.delivered
     } else {
       map.set(key, {
         theme: e.theme,
         type: e.type,
-        audiences: [e.audience],
+        audiences: [...e.audiences],
         emailCount: 1,
-        totalClicks: e.clicksCount,
-        totalOpens: e.opensCount,
+        totalClicks: e.clicks,
+        totalOpens: e.opens,
+        totalDelivered: e.delivered,
         isABTest: e.isABTest,
       })
     }
   }
 
-  return [...map.values()].sort((a, b) => b.emailCount - a.emailCount)
+  return [...map.values()].sort(
+    (a, b) => b.totalClicks - a.totalClicks || b.emailCount - a.emailCount
+  )
 }
 
 // ─── Skeleton ─────────────────────────────────────────────────────────────────
@@ -93,20 +108,17 @@ export default function DashboardPage() {
   const [data, setData] = useState<ApiResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [search, setSearch] = useState('')
 
   const fetchData = useCallback(async (days: Period) => {
     setLoading(true)
     setError('')
     try {
       const res = await fetch(`/api/hubspot/campaigns?days=${days}`)
-      console.log('[dashboard] API status:', res.status)
       const json: ApiResponse = await res.json()
-      console.log('[dashboard] API response:', json)
-      console.log('[dashboard] emails:', json.emails)
       if (!res.ok) throw new Error((json as unknown as { error?: string })?.error ?? `Erreur ${res.status}`)
       setData(json)
     } catch (err) {
-      console.error('[dashboard] API error:', err)
       setError(err instanceof Error ? err.message : 'Erreur inconnue')
     } finally {
       setLoading(false)
@@ -122,8 +134,20 @@ export default function DashboardPage() {
   const emailList = emails?.data ?? []
 
   const uniqueThemes = new Set(emailList.map((e) => e.theme)).size
-  const uniqueAudiences = new Set(emailList.map((e) => e.audience)).size
+  const uniqueAudiences = new Set(emailList.flatMap((e) => e.audiences)).size
   const themeRows = computeThemeRows(emailList)
+
+  const filteredRows = search.trim()
+    ? themeRows.filter((row) => {
+        const q = search.toLowerCase()
+        const typeLabel = (EMAIL_TYPE_LABELS[row.type as EmailType] ?? row.type).toLowerCase()
+        return (
+          row.theme.toLowerCase().includes(q) ||
+          typeLabel.includes(q) ||
+          row.audiences.some((a) => a.toLowerCase().includes(q))
+        )
+      })
+    : themeRows
 
   const PERIODS: { label: string; value: Period }[] = [
     { label: '7 j', value: 7 },
@@ -198,13 +222,30 @@ export default function DashboardPage() {
         />
       </div>
 
+      {/* Search bar */}
+      <div className="relative mb-4">
+        <span className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <circle cx="5.5" cy="5.5" r="4" stroke="#a3a3a3" strokeWidth="1.2" />
+            <path d="M8.5 8.5l3.5 3.5" stroke="#a3a3a3" strokeWidth="1.2" strokeLinecap="round" />
+          </svg>
+        </span>
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Rechercher une thématique, une audience…"
+          className="w-full pl-9 pr-4 py-2.5 text-sm text-[#0a0a0a] placeholder-[#a3a3a3] bg-white border border-[#e5e5e5] rounded-[4px] outline-none focus:border-[#0a0a0a] focus:ring-1 focus:ring-[#0a0a0a] transition-all duration-150"
+        />
+      </div>
+
       {/* Theme table */}
       <div className="bg-white border border-[#e5e5e5] rounded-[6px]">
         <div className="px-5 py-4 border-b border-[#e5e5e5] flex items-center justify-between">
           <h2 className="text-sm font-semibold text-[#0a0a0a]">Thématiques</h2>
           {!loading && (
             <span className="text-xs text-[#a3a3a3]">
-              {themeRows.length} thème{themeRows.length !== 1 ? 's' : ''}
+              {filteredRows.length} thème{filteredRows.length !== 1 ? 's' : ''}
               {emails?.count === 0 && (
                 <span className="ml-2 text-[#a3a3a3]">— emails non disponibles (scope manquant)</span>
               )}
@@ -227,48 +268,65 @@ export default function DashboardPage() {
               Array.from({ length: 5 }).map((_, i) => (
                 <tr key={i} className="border-b border-[#f5f5f5] last:border-0">
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-40" /></td>
-                  <td className="px-5 py-3.5"><Skeleton className="h-4 w-12" /></td>
+                  <td className="px-5 py-3.5"><Skeleton className="h-4 w-24" /></td>
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-16" /></td>
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-8" /></td>
-                  <td className="px-5 py-3.5"><Skeleton className="h-4 w-8" /></td>
+                  <td className="px-5 py-3.5"><Skeleton className="h-4 w-14" /></td>
                   <td className="px-5 py-3.5"><Skeleton className="h-4 w-14" /></td>
                 </tr>
               ))
-            ) : themeRows.length === 0 ? (
+            ) : filteredRows.length === 0 ? (
               <tr>
                 <td colSpan={6} className="px-5 py-10 text-center text-sm text-[#a3a3a3]">
-                  {emails?.count === 0
+                  {search.trim()
+                    ? 'Aucun résultat pour cette recherche.'
+                    : emails?.count === 0
                     ? 'Les emails individuels nécessitent le scope "content" dans l\'app HubSpot.'
                     : 'Aucun email sur cette période.'}
                 </td>
               </tr>
             ) : (
-              themeRows.map((row, i) => (
-                <tr
-                  key={`${row.theme}-${i}`}
-                  className="border-b border-[#f5f5f5] last:border-0 hover:bg-[#fafafa] transition-colors"
-                >
-                  <td className="px-5 py-3.5 text-[#0a0a0a] font-medium">
-                    <span className="flex items-center gap-2">
-                      {row.theme}
-                      {row.isABTest && (
-                        <span className="text-[10px] font-semibold text-[#737373] border border-[#e5e5e5] px-1.5 py-0.5 rounded-[2px]">
-                          A/B
+              filteredRows.map((row, i) => {
+                const typeLabel = EMAIL_TYPE_LABELS[row.type as EmailType] ?? row.type
+                const clickRateStr = fmtRate(row.totalClicks, row.totalDelivered)
+                const openRateStr = fmtRate(row.totalOpens, row.totalDelivered)
+                return (
+                  <tr
+                    key={`${row.theme}-${i}`}
+                    className="border-b border-[#f5f5f5] last:border-0 hover:bg-[#fafafa] transition-colors"
+                  >
+                    <td className="px-5 py-3.5 text-[#0a0a0a] font-medium">
+                      <span className="flex items-center gap-2">
+                        {row.theme}
+                        {row.isABTest && (
+                          <span className="text-[10px] font-semibold text-[#737373] border border-[#e5e5e5] px-1.5 py-0.5 rounded-[2px]">
+                            A/B
+                          </span>
+                        )}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3.5 text-[#737373]">{typeLabel}</td>
+                    <td className="px-5 py-3.5 text-[#737373]">{row.audiences.join(', ')}</td>
+                    <td className="px-5 py-3.5 text-[#0a0a0a] tabular-nums">{row.emailCount}</td>
+                    <td className="px-5 py-3.5">
+                      <span className="text-[#0a0a0a] tabular-nums">{fmtNumber(row.totalClicks)}</span>
+                      {clickRateStr && (
+                        <span className="block text-[10px] text-[#a3a3a3] tabular-nums mt-0.5">
+                          {clickRateStr}
                         </span>
                       )}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3.5 text-[#737373]">{row.type}</td>
-                  <td className="px-5 py-3.5 text-[#737373]">{row.audiences.join(', ')}</td>
-                  <td className="px-5 py-3.5 text-[#0a0a0a] tabular-nums">{row.emailCount}</td>
-                  <td className="px-5 py-3.5 text-[#0a0a0a] tabular-nums">
-                    {row.totalClicks ?? <span className="text-[#a3a3a3]">—</span>}
-                  </td>
-                  <td className="px-5 py-3.5 text-[#0a0a0a] tabular-nums">
-                    {row.totalOpens ?? <span className="text-[#a3a3a3]">—</span>}
-                  </td>
-                </tr>
-              ))
+                    </td>
+                    <td className="px-5 py-3.5">
+                      <span className="text-[#0a0a0a] tabular-nums">{fmtNumber(row.totalOpens)}</span>
+                      {openRateStr && (
+                        <span className="block text-[10px] text-[#a3a3a3] tabular-nums mt-0.5">
+                          {openRateStr}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })
             )}
           </tbody>
         </table>
