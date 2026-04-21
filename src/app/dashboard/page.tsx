@@ -6,7 +6,8 @@ import { useCallback, useEffect, useState } from 'react'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const PAGE_SIZE = 20
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const
+type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number]
 
 const TYPE_FILTER_OPTIONS: Array<{ value: EmailType | 'ALL'; label: string }> = [
   { value: 'ALL',       label: 'Tous' },
@@ -118,6 +119,7 @@ export default function DashboardPage() {
 
   // Pagination (0-based)
   const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState<PageSizeOption>(10)
 
   // ── Fetch ──────────────────────────────────────────────────────────────────
   const fetchData = useCallback(async (days: Period) => {
@@ -137,8 +139,8 @@ export default function DashboardPage() {
 
   useEffect(() => { fetchData(period) }, [period, fetchData])
 
-  // Reset page when any filter or period changes
-  useEffect(() => { setPage(0) }, [search, typeFilter, audienceFilter, period])
+  // Reset page when any filter, period or page size changes
+  useEffect(() => { setPage(0) }, [search, typeFilter, audienceFilter, period, pageSize])
 
   // ── Data derivation ────────────────────────────────────────────────────────
   const campaigns = data?.campaigns
@@ -174,7 +176,7 @@ export default function DashboardPage() {
     : afterAudience
 
   const totalRows = filteredRows.length
-  const pageRows  = filteredRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const pageRows  = filteredRows.slice(page * pageSize, (page + 1) * pageSize)
   const hasFilters = typeFilter !== 'ALL' || audienceFilter !== 'ALL' || search.trim() !== ''
 
   const resetFilters = () => {
@@ -193,9 +195,9 @@ export default function DashboardPage() {
 
   // ── Pagination helpers ─────────────────────────────────────────────────────
   const hasPrev = page > 0
-  const hasNext = (page + 1) * PAGE_SIZE < totalRows
-  const rangeStart = totalRows === 0 ? 0 : page * PAGE_SIZE + 1
-  const rangeEnd   = Math.min((page + 1) * PAGE_SIZE, totalRows)
+  const hasNext = (page + 1) * pageSize < totalRows
+  const rangeStart = totalRows === 0 ? 0 : page * pageSize + 1
+  const rangeEnd   = Math.min((page + 1) * pageSize, totalRows)
 
   return (
     <div className="px-8 py-8 max-w-[1200px]">
@@ -406,8 +408,10 @@ export default function DashboardPage() {
         </table>
 
         {/* ── Pagination ──────────────────────────────────────────────────────── */}
-        {!loading && totalRows > PAGE_SIZE && (
-          <div className="px-5 py-3 border-t border-[#e5e5e5] flex items-center justify-between">
+        {!loading && totalRows > 0 && (
+          <div className="px-5 py-3 border-t border-[#e5e5e5] flex items-center justify-between gap-4">
+
+            {/* ← Précédent */}
             <button
               onClick={() => setPage((p) => p - 1)}
               disabled={!hasPrev}
@@ -423,10 +427,31 @@ export default function DashboardPage() {
               Précédent
             </button>
 
-            <span className="text-xs text-[#737373]">
-              {rangeStart}–{rangeEnd} sur {totalRows} thème{totalRows !== 1 ? 's' : ''}
-            </span>
+            {/* Centre : indicateur + sélecteur */}
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-[#737373]">
+                {rangeStart}–{rangeEnd} sur {totalRows} thème{totalRows !== 1 ? 's' : ''}
+              </span>
 
+              {/* Page size toggle buttons */}
+              <div className="flex items-center border border-[#e5e5e5] rounded-[4px] overflow-hidden">
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <button
+                    key={size}
+                    onClick={() => setPageSize(size)}
+                    className={`px-2.5 py-1 text-xs font-medium transition-colors ${
+                      pageSize === size
+                        ? 'bg-[#0a0a0a] text-white'
+                        : 'bg-white text-[#737373] hover:bg-[#f5f5f5] hover:text-[#0a0a0a]'
+                    }`}
+                  >
+                    {size}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Suivant → */}
             <button
               onClick={() => setPage((p) => p + 1)}
               disabled={!hasNext}
@@ -441,6 +466,7 @@ export default function DashboardPage() {
                 <path d="M5.5 3L9.5 7l-4 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </button>
+
           </div>
         )}
       </div>
