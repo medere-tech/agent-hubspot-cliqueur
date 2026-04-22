@@ -1,3 +1,6 @@
+import { getInscriptionsByEmail } from '@/lib/airtable'
+import type { Inscription } from '@/lib/airtable'
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type EmailType = 'CV' | 'PRES' | 'EL' | 'WEBINAIRE' | 'NEWSLETTER' | 'AUTRE'
@@ -499,113 +502,130 @@ export async function getMarketingEmails(
 // ─── getTopClickers ───────────────────────────────────────────────────────────
 
 export interface TopClicker {
-  contactId: number | null
+  contactId: number
   emailAddress: string
+  /** Lifetime total — hs_email_click (non filtrable par période via CRM API) */
   totalClicks: number
-  clickedThemes: string[]
-  audiences: string[]
+  totalOpens: number
+  totalDelivered: number
+  openRate: number | null
 }
 
-interface HubSpotV1Recipient {
-  contactId?: number
-  emailAddress: string
-  /** Number of times this contact clicked in this campaign. May be absent → default 1. */
-  clickCount?: number
+interface CrmContactSearchResult {
+  id: string
+  properties: {
+    email: string | null
+    hs_email_click: string | null
+    hs_email_open: string | null
+    hs_email_delivered: string | null
+  }
 }
 
-interface HubSpotV1RecipientsResponse {
-  recipients: HubSpotV1Recipient[]
-  hasMore: boolean
-  /** Numeric offset for the next page */
-  offset?: number
-  total?: number
-}
-
-/**
- * Paginate through all CLICKED recipients for one campaign.
- * Caps at 500 recipients per email to avoid runaway pagination.
- */
-async function getEmailRecipients(emailId: string): Promise<HubSpotV1Recipient[]> {
-  const all: HubSpotV1Recipient[] = []
-  let offset: number | undefined
-  const MAX_PER_EMAIL = 500
-
-  do {
-    const params: Record<string, string> = { status: 'CLICKED', limit: '100' }
-    if (offset !== undefined) params.offset = String(offset)
-
-    const page = await hubspotFetch<HubSpotV1RecipientsResponse>(
-      `/email/public/v1/campaigns/${emailId}/recipients`,
-      params,
-      { revalidate: 300 }
-    )
-
-    all.push(...page.recipients)
-    offset = page.hasMore && page.offset !== undefined ? page.offset : undefined
-  } while (offset !== undefined && all.length < MAX_PER_EMAIL)
-
-  return all
+interface CrmContactSearchResponse {
+  total: number
+  results: CrmContactSearchResult[]
+  paging?: { next?: { after: string } }
 }
 
 /**
- * Fetch top 100 contacts by total clicks across all sent emails in the period.
+ * Fetch top 100 contacts ranked by lifetime email clicks.
  *
- * Strategy:
- *  1. Get all email campaigns via getMarketingEmails(days).
- *  2. Fetch CLICKED recipients for each email in batches of 5.
- *  3. Aggregate by emailAddress: sum clicks, collect unique themes + audiences.
- *  4. Sort descending by totalClicks, return top 100.
+ * Source: POST /crm/v3/objects/contacts/search
+ * — hs_email_click is a cumulative lifetime counter, not period-specific.
+ *   The `days` parameter is accepted for API consistency but does not affect
+ *   the ranking (HubSpot CRM does not expose per-period click counts).
+ *
+ * Note: /email/public/v1/campaigns/{id}/recipients returns 404 with this
+ * token's scopes. Paginating the events API for 90d would exceed Vercel
+ * timeouts. CRM search is the only reliable, fast data source.
  */
-export async function getTopClickers(days: 7 | 28 | 90 | 360): Promise<TopClicker[]> {
-  const emails = await getMarketingEmails(days)
+export async function getTopClickers(_days: 7 | 28 | 90 | 360): Promise<TopClicker[]> {
+  const token = process.env.HUBSPOT_ACCESS_TOKEN
+  if (!token) throw new Error('HUBSPOT_ACCESS_TOKEN is not set')
 
-  const map = new Map<string, TopClicker>()
+  const results: TopClicker[] = []
+  let after: string | undefined
+  const LIMIT = 100
 
-  // Process 5 emails at a time to stay within HubSpot rate limits
-  const RECIPIENTS_BATCH_SIZE = 5
-
-  for (let i = 0; i < emails.length; i += RECIPIENTS_BATCH_SIZE) {
-    const batch = emails.slice(i, i + RECIPIENTS_BATCH_SIZE)
-
-    const batchResults = await Promise.all(
-      batch.map(async (email) => {
-        try {
-          const recipients = await getEmailRecipients(email.id)
-          return { email, recipients }
-        } catch {
-          return { email, recipients: [] as HubSpotV1Recipient[] }
-        }
-      })
-    )
-
-    for (const { email, recipients } of batchResults) {
-      for (const r of recipients) {
-        const key = r.emailAddress.toLowerCase()
-        const clicks = r.clickCount ?? 1
-        const existing = map.get(key)
-
-        if (existing) {
-          existing.totalClicks += clicks
-          if (!existing.clickedThemes.includes(email.theme)) {
-            existing.clickedThemes.push(email.theme)
-          }
-          for (const a of email.audiences) {
-            if (!existing.audiences.includes(a)) existing.audiences.push(a)
-          }
-        } else {
-          map.set(key, {
-            contactId: r.contactId ?? null,
-            emailAddress: r.emailAddress,
-            totalClicks: clicks,
-            clickedThemes: [email.theme],
-            audiences: [...email.audiences],
-          })
-        }
-      }
+  while (results.length < LIMIT) {
+    const payload = {
+      filterGroups: [
+        { filters: [{ propertyName: 'hs_email_click', operator: 'GT', value: '0' }] },
+      ],
+      sorts: [{ propertyName: 'hs_email_click', direction: 'DESCENDING' }],
+      properties: ['email', 'hs_email_click', 'hs_email_open', 'hs_email_delivered'],
+      limit: LIMIT,
+      ...(after ? { after } : {}),
     }
+
+    const res = await fetch(`${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      next: { revalidate: 300 },
+    })
+
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`HubSpot CRM search error ${res.status}: ${text}`)
+    }
+
+    const data = (await res.json()) as CrmContactSearchResponse
+
+    for (const c of data.results) {
+      const email = c.properties.email
+      if (!email) continue
+      const clicks    = parseInt(c.properties.hs_email_click    ?? '0', 10)
+      const opens     = parseInt(c.properties.hs_email_open     ?? '0', 10)
+      const delivered = parseInt(c.properties.hs_email_delivered ?? '0', 10)
+      results.push({
+        contactId:   parseInt(c.id, 10),
+        emailAddress: email,
+        totalClicks:  clicks,
+        totalOpens:   opens,
+        totalDelivered: delivered,
+        openRate: delivered > 0 ? (opens / delivered) * 100 : null,
+      })
+    }
+
+    after = data.paging?.next?.after
+    if (!after || results.length >= LIMIT) break
   }
 
-  return [...map.values()]
-    .sort((a, b) => b.totalClicks - a.totalClicks)
-    .slice(0, 100)
+  return results.slice(0, LIMIT)
+}
+
+// ─── getTopClickersEnriched ───────────────────────────────────────────────────
+
+export interface EnrichedTopClicker extends TopClicker {
+  inscriptions: Inscription[]
+  isInscrit: boolean
+  nbInscriptions: number
+}
+
+/**
+ * Enrich top 100 HubSpot clickers with Airtable inscription data.
+ *
+ * Uses targeted Airtable queries (10 emails per batch) instead of fetching
+ * all 22k+ records — total Airtable calls ≤ 10 for 100 contacts.
+ */
+export async function getTopClickersEnriched(
+  days: 7 | 28 | 90 | 360
+): Promise<EnrichedTopClicker[]> {
+  const topClickers = await getTopClickers(days)
+  const emails = topClickers.map((c) => c.emailAddress)
+  const inscriptionsMap = await getInscriptionsByEmail(emails)
+
+  return topClickers.map((contact) => {
+    const inscriptions = inscriptionsMap.get(contact.emailAddress.toLowerCase()) ?? []
+    return {
+      ...contact,
+      inscriptions,
+      isInscrit:       inscriptions.length > 0,
+      nbInscriptions:  inscriptions.length,
+    }
+  })
 }

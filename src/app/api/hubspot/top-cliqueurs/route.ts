@@ -1,13 +1,22 @@
 import { unstable_cache } from 'next/cache'
 import { auth } from '@/lib/auth'
-import { getTopClickers } from '@/lib/hubspot'
+import { getTopClickersEnriched } from '@/lib/hubspot'
 import { NextRequest, NextResponse } from 'next/server'
 
 const VALID_DAYS = [7, 28, 90, 360] as const
 type ValidDays = (typeof VALID_DAYS)[number]
 
-const getCachedTopClickers = unstable_cache(
-  async (days: ValidDays) => getTopClickers(days),
+const getCachedData = unstable_cache(
+  async (days: ValidDays) => {
+    const contacts = await getTopClickersEnriched(days)
+    return {
+      contacts,
+      segments: {
+        inscrits:             contacts.filter((c) => c.isInscrit),
+        non_inscrits_engages: contacts.filter((c) => !c.isInscrit && c.totalClicks >= 3),
+      },
+    }
+  },
   ['hubspot-top-clickers'],
   { revalidate: 300, tags: ['hubspot'] }
 )
@@ -25,8 +34,13 @@ export async function GET(req: NextRequest) {
     : 90
 
   try {
-    const contacts = await getCachedTopClickers(days)
-    return NextResponse.json({ days, count: contacts.length, contacts })
+    const { contacts, segments } = await getCachedData(days)
+    return NextResponse.json({
+      days,
+      count: contacts.length,
+      contacts,
+      segments,
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     console.error('[api/hubspot/top-cliqueurs]', message)

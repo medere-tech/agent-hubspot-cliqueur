@@ -5,6 +5,8 @@
  * Usage : npx tsx --env-file=.env.local scripts/test-hubspot-stats.ts
  */
 
+export {}
+
 const TOKEN = process.env.HUBSPOT_ACCESS_TOKEN
 if (!TOKEN) {
   console.error('HUBSPOT_ACCESS_TOKEN manquant')
