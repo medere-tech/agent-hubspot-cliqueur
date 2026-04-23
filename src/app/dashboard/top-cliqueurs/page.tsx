@@ -1,7 +1,8 @@
 'use client'
 
-import type { EnrichedTopClicker } from '@/lib/hubspot'
+import type { EnrichedTopClicker, MarketingEmail } from '@/lib/hubspot'
 import { useCallback, useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -12,6 +13,10 @@ type Period = 7 | 28 | 90 | 360
 type Segment = 'all' | 'inscrits' | 'non_inscrits'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+interface CampaignsApiResponse {
+  emails: { data: MarketingEmail[] }
+}
 
 interface ApiResponse {
   days: number
@@ -32,6 +37,16 @@ function fmtNumber(n: number): string {
 function fmtRate(rate: number | null): string {
   if (rate === null) return '—'
   return rate.toFixed(1) + '\u202f%'
+}
+
+function uniqueSortedThemes(emails: MarketingEmail[]): string[] {
+  const themes = new Set<string>()
+  for (const e of emails) {
+    if (e.theme && e.theme !== 'Sans thème' && e.theme !== 'Newsletter') {
+      themes.add(e.theme)
+    }
+  }
+  return [...themes].sort((a, b) => a.localeCompare(b, 'fr'))
 }
 
 function downloadCSV(contacts: EnrichedTopClicker[], segment: Segment) {
@@ -104,6 +119,7 @@ function BadgeNonInscrit() {
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function TopCliqueurs() {
+  const router = useRouter()
   const [data, setData] = useState<ApiResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -111,8 +127,10 @@ export default function TopCliqueurs() {
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState<PageSizeOption>(10)
+  const [themes, setThemes] = useState<string[]>([])
+  const [themeFilter, setThemeFilter] = useState('')
 
-  // ── Fetch (données globales, pas de filtre par période) ────────────────────
+  // ── Fetch top cliqueurs ────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
     setLoading(true)
     setError('')
@@ -128,8 +146,18 @@ export default function TopCliqueurs() {
     }
   }, [])
 
+  // ── Fetch themes from campaigns (fire-and-forget) ─────────────────────────
+  useEffect(() => {
+    fetch('/api/hubspot/campaigns?days=360')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((json: CampaignsApiResponse | null) => {
+        if (json?.emails?.data) setThemes(uniqueSortedThemes(json.emails.data))
+      })
+      .catch(() => {})
+  }, [])
+
   useEffect(() => { fetchData() }, [fetchData])
-  useEffect(() => { setPage(0) }, [search, segment, pageSize])
+  useEffect(() => { setPage(0) }, [search, segment, pageSize, themeFilter])
 
   // ── Source de données selon le segment ────────────────────────────────────
   const allContacts    = data?.contacts ?? []
@@ -141,9 +169,18 @@ export default function TopCliqueurs() {
     segment === 'non_inscrits' ? nonInscrits :
     allContacts
 
-  const filteredContacts = search.trim()
-    ? sourceContacts.filter((c) => c.emailAddress.toLowerCase().includes(search.toLowerCase()))
+  // ── Filtre thématique (intersection via inscriptions Airtable) ────────────
+  const themeContacts = themeFilter
+    ? sourceContacts.filter((c) =>
+        c.inscriptions.some((ins) =>
+          ins.nomFormation.toLowerCase().includes(themeFilter.toLowerCase())
+        )
+      )
     : sourceContacts
+
+  const filteredContacts = search.trim()
+    ? themeContacts.filter((c) => c.emailAddress.toLowerCase().includes(search.toLowerCase()))
+    : themeContacts
 
   const totalRows  = filteredContacts.length
   const pageRows   = filteredContacts.slice(page * pageSize, (page + 1) * pageSize)
@@ -159,10 +196,17 @@ export default function TopCliqueurs() {
     ['Contact', 'Clics totaux', 'Ouvertures', 'Taux d\'ouverture', 'Statut']
 
   const SEGMENTS: { value: Segment; label: string; count: number }[] = [
-    { value: 'all',          label: 'Tous',                  count: allContacts.length },
-    { value: 'inscrits',     label: 'Inscrits',              count: inscrits.length },
+    { value: 'all',          label: 'Tous',                    count: allContacts.length },
+    { value: 'inscrits',     label: 'Inscrits',                count: inscrits.length },
     { value: 'non_inscrits', label: 'Non inscrits (3+ clics)', count: nonInscrits.length },
   ]
+
+  // Source pour "Créer une liste"
+  const listSource: 'inscrits' | 'non_inscrits' =
+    segment === 'non_inscrits' ? 'non_inscrits' : 'inscrits'
+
+  const listLabel =
+    segment === 'non_inscrits' ? 'non inscrits' : 'inscrits'
 
   return (
     <div className="px-8 py-8 max-w-[1200px]">
@@ -210,7 +254,7 @@ export default function TopCliqueurs() {
         {SEGMENTS.map(({ value, label, count }) => (
           <button
             key={value}
-            onClick={() => setSegment(value)}
+            onClick={() => { setSegment(value); setThemeFilter('') }}
             className={`px-3 py-1.5 text-xs font-medium rounded-[4px] border transition-colors ${
               segment === value
                 ? 'bg-[#0a0a0a] text-white border-[#0a0a0a]'
@@ -226,6 +270,59 @@ export default function TopCliqueurs() {
           </button>
         ))}
       </div>
+
+      {/* ── Filtre thématique ───────────────────────────────────────────────── */}
+      {themes.length > 0 && (
+        <div className="flex items-center gap-2 mb-4 flex-wrap">
+          <div className="relative">
+            <select
+              value={themeFilter}
+              onChange={(e) => setThemeFilter(e.target.value)}
+              className="pl-3 pr-8 py-2 text-xs text-[#0a0a0a] bg-white border border-[#e5e5e5] rounded-[4px] outline-none focus:border-[#0a0a0a] transition-all appearance-none cursor-pointer"
+            >
+              <option value="">Toutes les thématiques</option>
+              {themes.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+            <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                <path d="M2 3.5l3 3 3-3" stroke="#a3a3a3" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </span>
+          </div>
+
+          {themeFilter && (
+            <>
+              <span className="text-xs text-[#a3a3a3]">
+                {themeContacts.length} contact{themeContacts.length !== 1 ? 's' : ''}
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  router.push(
+                    `/dashboard/listes?source=${listSource}&theme=${encodeURIComponent(themeFilter)}`
+                  )
+                }
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#0a0a0a] bg-white border border-[#0a0a0a] rounded-[4px] hover:bg-[#0a0a0a] hover:text-white transition-colors"
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                  <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.2" />
+                  <path d="M4.5 6h3M6 4.5v3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+                </svg>
+                Créer une liste ({listLabel})
+              </button>
+              <button
+                type="button"
+                onClick={() => setThemeFilter('')}
+                className="text-xs text-[#a3a3a3] hover:text-[#0a0a0a] transition-colors"
+              >
+                Effacer
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       {/* ── Search ──────────────────────────────────────────────────────────── */}
       <div className="relative mb-4">
