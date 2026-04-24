@@ -232,4 +232,4 @@ npx tsx --env-file=.env.local --tsconfig tsconfig.json scripts/test-sync.ts
 - **Client final** : Arnaud (marketing automation chez Médéré)
 - **Médéré** : organisme de formation médicale et dentaire certifié DPC
 - **Objectif** : segmenter les contacts selon leur appétence thématique pour personnaliser les campagnes email
-- **L'app doit être durable** : si Arnaud quitte l'entreprise, son remplaçant doit pouvoir l'utiliser sans formation
+- **L'app doit être durable** : si Arnaud quitte l'entreprise, son remplaçant doit pouvoir l'utiliser sans formation.
