@@ -32,7 +32,7 @@ src/
   app/
     api/
       auth/[...nextauth]/         # Auth NextAuth
-      cron/sync-contacts/         # Cron Vercel — sync quotidienne 3h UTC
+      cron/sync-contacts/         # Cron Vercel — sync paginée toutes les 6h
       hubspot/
         campaigns/                # GET campagnes email HubSpot
         listes/                   # GET listes existantes / POST création liste
@@ -177,8 +177,8 @@ Les emails HubSpot suivent ce pattern :
 | Page gestion listes (vue + création) | `app/dashboard/listes/` |
 | Export CSV | `app/dashboard/export/` |
 | Croisement HubSpot × Airtable (inscrits/non-inscrits) | `lib/sync.ts`, `lib/airtable.ts` |
-| Pipeline sync complet (top 100 → thèmes → Supabase upsert) | `lib/sync.ts` |
-| Cron Vercel quotidien à 3h UTC | `app/api/cron/sync-contacts/`, `vercel.json` |
+| Pipeline sync paginé (150 contacts/run → thèmes → Supabase upsert, cap 10 000) | `lib/sync.ts` |
+| Cron Vercel toutes les 6h (4x/jour, cycle complet ~23j) | `app/api/cron/sync-contacts/`, `vercel.json` |
 | Sidebar navigation | `components/sidebar.tsx` |
 
 ### En cours / Bloquant
