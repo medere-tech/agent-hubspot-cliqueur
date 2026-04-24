@@ -59,7 +59,7 @@ export interface MarketingEmail extends ParsedCampaignName {
   opens: number
   delivered: number
   sent: number
-  /** Taux d'ouverture en % (opens / delivered * 100), null si delivered = 0 */
+  /** Taux d'ouvertures en % (opens / delivered * 100), null si delivered = 0 */
   openRate: number | null
   /** Taux de clic en % (clicks / delivered * 100), null si delivered = 0 */
   clickRate: number | null
