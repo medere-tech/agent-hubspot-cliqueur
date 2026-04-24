@@ -282,7 +282,7 @@ export async function syncAllTopClickers(
     const inscriptionsMap = await getInscriptionsByEmail(emails)
     onProgress?.('[sync] Inscriptions chargées — démarrage de la sync contact par contact')
 
-    // ── 5. Process contacts ───────────────────────────────────────────────
+    // ── 5. Process contact ───────────────────────────────────────────────
     let synced = 0
     let errors = 0
 
