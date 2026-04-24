@@ -499,6 +499,40 @@ export async function getMarketingEmails(
   return emails
 }
 
+// ─── getTotalClickersCount ────────────────────────────────────────────────────
+
+/**
+ * Returns total count of HubSpot contacts with hs_email_click > 0.
+ * Uses a single search request with limit=1 to read `data.total`.
+ */
+export async function getTotalClickersCount(): Promise<number> {
+  const token = process.env.HUBSPOT_ACCESS_TOKEN
+  if (!token) throw new Error('HUBSPOT_ACCESS_TOKEN is not set')
+
+  const res = await fetch(`${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      filterGroups: [
+        { filters: [{ propertyName: 'hs_email_click', operator: 'GT', value: '0' }] },
+      ],
+      limit: 1,
+    }),
+    cache: 'no-store',
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`HubSpot CRM count error ${res.status}: ${text}`)
+  }
+
+  const data = (await res.json()) as { total: number }
+  return data.total
+}
+
 // ─── getTopClickers ───────────────────────────────────────────────────────────
 
 export interface TopClicker {
@@ -528,33 +562,42 @@ interface CrmContactSearchResponse {
 }
 
 /**
- * Fetch top 100 contacts ranked by lifetime email clicks.
+ * Fetch a window of contacts ranked by lifetime email clicks.
  *
- * Source: POST /crm/v3/objects/contacts/search
- * — hs_email_click is a cumulative lifetime counter, not period-specific.
- *   The `days` parameter is accepted for API consistency but does not affect
- *   the ranking (HubSpot CRM does not expose per-period click counts).
+ * Pagination:
+ *  - `limit`  = total number of contacts to return (default 150).
+ *  - `offset` = starting position, passed as the initial `after` cursor.
+ *    HubSpot CRM search treats `after` as a numeric offset in practice,
+ *    though the docs call it an opaque cursor. Each returned `after` is
+ *    validated as numeric — any non-numeric value indicates an API change
+ *    and aborts pagination with a warning.
  *
- * Note: /email/public/v1/campaigns/{id}/recipients returns 404 with this
- * token's scopes. Paginating the events API for 90d would exceed Vercel
- * timeouts. CRM search is the only reliable, fast data source.
+ * IMPORTANT: HubSpot CRM v3 search caps pagination at offset 10 000.
+ * The caller is responsible for keeping offset + limit <= 10 000.
  */
-export async function getTopClickers(_days: 7 | 28 | 90 | 360): Promise<TopClicker[]> {
+export async function getTopClickers(
+  _days: 7 | 28 | 90 | 360,
+  limit: number = 150,
+  offset: number = 0
+): Promise<TopClicker[]> {
   const token = process.env.HUBSPOT_ACCESS_TOKEN
   if (!token) throw new Error('HUBSPOT_ACCESS_TOKEN is not set')
 
   const results: TopClicker[] = []
-  let after: string | undefined
-  const LIMIT = 100
+  const PAGE_SIZE = 100 // HubSpot CRM search hard max per request
+  let after: string | undefined = offset > 0 ? String(offset) : undefined
 
-  while (results.length < LIMIT) {
+  while (results.length < limit) {
+    const remaining = limit - results.length
+    const pageLimit = Math.min(PAGE_SIZE, remaining)
+
     const payload = {
       filterGroups: [
         { filters: [{ propertyName: 'hs_email_click', operator: 'GT', value: '0' }] },
       ],
       sorts: [{ propertyName: 'hs_email_click', direction: 'DESCENDING' }],
       properties: ['email', 'hs_email_click', 'hs_email_open', 'hs_email_delivered'],
-      limit: LIMIT,
+      limit: pageLimit,
       ...(after ? { after } : {}),
     }
 
@@ -582,20 +625,28 @@ export async function getTopClickers(_days: 7 | 28 | 90 | 360): Promise<TopClick
       const opens     = parseInt(c.properties.hs_email_open     ?? '0', 10)
       const delivered = parseInt(c.properties.hs_email_delivered ?? '0', 10)
       results.push({
-        contactId:   parseInt(c.id, 10),
-        emailAddress: email,
-        totalClicks:  clicks,
-        totalOpens:   opens,
+        contactId:      parseInt(c.id, 10),
+        emailAddress:   email,
+        totalClicks:    clicks,
+        totalOpens:     opens,
         totalDelivered: delivered,
         openRate: delivered > 0 ? (opens / delivered) * 100 : null,
       })
     }
 
-    after = data.paging?.next?.after
-    if (!after || results.length >= LIMIT) break
+    const nextAfter = data.paging?.next?.after
+    if (!nextAfter) break
+
+    // Safety: detect HubSpot API change — after must be a numeric offset
+    if (!/^\d+$/.test(nextAfter)) {
+      console.warn(`[hubspot] ⚠ after cursor non numérique: ${nextAfter}`)
+      break
+    }
+
+    after = nextAfter
   }
 
-  return results.slice(0, LIMIT)
+  return results.slice(0, limit)
 }
 
 // ─── getTopClickersEnriched ───────────────────────────────────────────────────
@@ -615,7 +666,7 @@ export interface EnrichedTopClicker extends TopClicker {
 export async function getTopClickersEnriched(
   days: 7 | 28 | 90 | 360
 ): Promise<EnrichedTopClicker[]> {
-  const topClickers = await getTopClickers(days)
+  const topClickers = await getTopClickers(days, 100, 0)
   const emails = topClickers.map((c) => c.emailAddress)
   const inscriptionsMap = await getInscriptionsByEmail(emails)
 

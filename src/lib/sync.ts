@@ -1,4 +1,4 @@
-import { getTopClickers, parseEmailName } from '@/lib/hubspot'
+import { getTopClickers, getTotalClickersCount, parseEmailName } from '@/lib/hubspot'
 import { getInscriptionsByEmail } from '@/lib/airtable'
 import { createSupabaseAdmin } from '@/lib/supabase'
 
@@ -24,6 +24,11 @@ export interface SyncResult {
   synced: number
   errors: number
   duration: number // ms
+  startOffset: number
+  endOffset: number
+  totalContacts: number
+  fullCycleCompleted: boolean
+  skipped: boolean
 }
 
 // ─── Internal types ───────────────────────────────────────────────────────────
@@ -149,16 +154,37 @@ export async function getContactClickThemes(email: string): Promise<ContactClick
 
 // ─── syncAllTopClickers ───────────────────────────────────────────────────────
 
+const HUBSPOT_SEARCH_CAP = 10_000 // HubSpot CRM v3 search hard limit
+const DEFAULT_BATCH_SIZE = 150
+const LOCK_TTL_MS = 5 * 60_000 // 5 minutes — safety net for crashed runs
+
+interface SyncCursorRow {
+  id: string
+  current_offset: number
+  total_contacts: number
+  last_run_at: string
+  full_cycle_completed_at: string | null
+  locked_until: string | null
+}
+
 /**
- * Full sync: top 100 HubSpot clickers → click themes → Supabase upsert.
- * Sequential processing to respect HubSpot rate limits (~10 req/s v1 API).
+ * Paginated sync with cursor + double-run protection.
  *
- * @param onProgress  Optional callback for real-time log messages.
- * @param maxContacts Limit for testing (default: all 100).
+ * Flow:
+ *  1. Atomic UPDATE on sync_cursor to acquire a 5-min lock AND read the row.
+ *  2. On Supabase error → log warning, proceed with offset=0 and no lock
+ *     (cron must run even if cursor is temporarily unreadable).
+ *  3. On 0 rows affected → another run holds the lock → return early.
+ *  4. Fetch next window from HubSpot, sync contacts.
+ *  5. Final upsert advances offset + releases lock (locked_until = NULL).
+ *  6. finally: safety net release if the run crashed before step 5.
+ *
+ * @param onProgress    Optional callback for real-time log messages.
+ * @param batchOverride Optional batch size override (for testing).
  */
 export async function syncAllTopClickers(
   onProgress?: (msg: string) => void,
-  maxContacts?: number
+  batchOverride?: number
 ): Promise<SyncResult> {
   const start = Date.now()
 
@@ -168,70 +194,188 @@ export async function syncAllTopClickers(
   const supabase = createSupabaseAdmin()
   campaignNameCache.clear()
 
-  onProgress?.('[sync] Récupération des top cliqueurs HubSpot...')
-  const allClickers = await getTopClickers(360)
-  const clickers = maxContacts ? allClickers.slice(0, maxContacts) : allClickers
+  // ── 1. Acquire lock + read cursor (combined atomic UPDATE ... RETURNING) ──
+  const nowIso = new Date().toISOString()
+  const lockUntilIso = new Date(Date.now() + LOCK_TTL_MS).toISOString()
 
-  onProgress?.(`[sync] ${clickers.length} contacts à synchroniser`)
-  onProgress?.('[sync] Récupération des inscriptions Airtable...')
+  const { data: lockRows, error: lockErr } = await supabase
+    .from('sync_cursor')
+    .update({ locked_until: lockUntilIso })
+    .eq('id', 'main')
+    .or(`locked_until.is.null,locked_until.lt.${nowIso}`)
+    .select()
 
-  const emails = clickers.map((c) => c.emailAddress)
-  const inscriptionsMap = await getInscriptionsByEmail(emails)
+  let startOffset = 0
+  let previousFullCycleAt: string | null = null
+  let lockAcquired = false
 
-  onProgress?.(`[sync] Inscriptions chargées — démarrage de la sync contact par contact`)
-
-  let synced = 0
-  let errors = 0
-
-  for (let i = 0; i < clickers.length; i++) {
-    const contact = clickers[i]
-    const label = `Contact ${i + 1}/${clickers.length} — ${contact.emailAddress}`
-    onProgress?.(label)
-
-    try {
-      // 1. Fetch click events and derive themes
-      const clickThemes = await getContactClickThemes(contact.emailAddress)
-
-      // 2. Cross-reference inscriptions
-      const inscriptions = inscriptionsMap.get(contact.emailAddress.toLowerCase()) ?? []
-      const isInscrit = inscriptions.length > 0
-
-      // 3. Upsert to Supabase
-      const row = {
-        email:          contact.emailAddress.toLowerCase(),
-        contact_id:     String(contact.contactId),
-        total_clicks:   contact.totalClicks,
-        themes:         clickThemes.themes,
-        is_inscrit:     isInscrit,
-        inscriptions:   inscriptions.map((ins) => ({
-          nomFormation: ins.nomFormation,
-          specialite:   ins.specialite,
-          dateCreation: ins.dateCreation,
-        })),
-        last_synced_at: new Date().toISOString(),
-      }
-
-      const { error } = await supabase
-        .from('contact_click_themes')
-        .upsert(row, { onConflict: 'email' })
-
-      if (error) throw new Error(error.message)
-
-      synced++
-      onProgress?.(`  → OK — ${clickThemes.themes.length} thème(s) — inscrit=${isInscrit}`)
-    } catch (err) {
-      errors++
-      onProgress?.(`  → ERREUR — ${err instanceof Error ? err.message : String(err)}`)
+  if (lockErr) {
+    onProgress?.(`[sync] ⚠ Curseur illisible, fallback offset=0 (err: ${lockErr.message})`)
+  } else if (!lockRows || lockRows.length === 0) {
+    onProgress?.('[sync] Run déjà en cours, skip')
+    return {
+      synced: 0,
+      errors: 0,
+      duration: Date.now() - start,
+      startOffset: 0,
+      endOffset: 0,
+      totalContacts: 0,
+      fullCycleCompleted: false,
+      skipped: true,
     }
-
-    // 150ms between contacts to stay under HubSpot v1 rate limit (100 req/10s)
-    if (i < clickers.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 150))
-    }
+  } else {
+    const row = lockRows[0] as SyncCursorRow
+    startOffset = row.current_offset ?? 0
+    previousFullCycleAt = row.full_cycle_completed_at
+    lockAcquired = true
   }
 
-  const duration = Date.now() - start
-  onProgress?.(`[sync] Terminé — ${synced} synced, ${errors} errors, ${(duration / 1000).toFixed(1)}s`)
+  try {
+    // ── 2. Refresh total from HubSpot ─────────────────────────────────────
+    onProgress?.('[sync] Récupération du total HubSpot...')
+    const total = await getTotalClickersCount()
+    const effectiveTotal = Math.min(total, HUBSPOT_SEARCH_CAP)
 
-  return { synced, errors, duration }
+    // ── 3. Compute batch window ───────────────────────────────────────────
+    const batchSize = batchOverride ?? DEFAULT_BATCH_SIZE
+    const remaining = Math.max(0, effectiveTotal - startOffset)
+    const limit = Math.min(batchSize, remaining)
+
+    // Reset path — cursor has reached (or passed) the cap
+    if (limit === 0) {
+      onProgress?.(
+        `[sync] Fin de cycle (offset=${startOffset}, cap=${effectiveTotal}) — reset à 0`
+      )
+      const resetIso = new Date().toISOString()
+      await supabase.from('sync_cursor').upsert({
+        id: 'main',
+        current_offset: 0,
+        total_contacts: total,
+        last_run_at: resetIso,
+        full_cycle_completed_at: resetIso,
+        locked_until: null,
+      })
+      lockAcquired = false // released via upsert above
+      return {
+        synced: 0,
+        errors: 0,
+        duration: Date.now() - start,
+        startOffset,
+        endOffset: 0,
+        totalContacts: total,
+        fullCycleCompleted: true,
+        skipped: false,
+      }
+    }
+
+    // ── 4. Fetch contact window ───────────────────────────────────────────
+    const runNumber = Math.floor(startOffset / DEFAULT_BATCH_SIZE) + 1
+    onProgress?.(
+      `[sync] Run ${runNumber} — contacts ${startOffset + 1}-${startOffset + limit} / ${total}`
+    )
+
+    const clickers = await getTopClickers(360, limit, startOffset)
+    onProgress?.(`[sync] ${clickers.length} contacts récupérés`)
+
+    onProgress?.('[sync] Récupération des inscriptions Airtable...')
+    const emails = clickers.map((c) => c.emailAddress)
+    const inscriptionsMap = await getInscriptionsByEmail(emails)
+    onProgress?.('[sync] Inscriptions chargées — démarrage de la sync contact par contact')
+
+    // ── 5. Process contacts ───────────────────────────────────────────────
+    let synced = 0
+    let errors = 0
+
+    for (let i = 0; i < clickers.length; i++) {
+      const contact = clickers[i]
+      onProgress?.(`Contact ${i + 1}/${clickers.length} — ${contact.emailAddress}`)
+
+      try {
+        const clickThemes = await getContactClickThemes(contact.emailAddress)
+        const inscriptions = inscriptionsMap.get(contact.emailAddress.toLowerCase()) ?? []
+        const isInscrit = inscriptions.length > 0
+
+        const row = {
+          email:          contact.emailAddress.toLowerCase(),
+          contact_id:     String(contact.contactId),
+          total_clicks:   contact.totalClicks,
+          themes:         clickThemes.themes,
+          is_inscrit:     isInscrit,
+          inscriptions:   inscriptions.map((ins) => ({
+            nomFormation: ins.nomFormation,
+            specialite:   ins.specialite,
+            dateCreation: ins.dateCreation,
+          })),
+          last_synced_at: new Date().toISOString(),
+        }
+
+        const { error } = await supabase
+          .from('contact_click_themes')
+          .upsert(row, { onConflict: 'email' })
+
+        if (error) throw new Error(error.message)
+
+        synced++
+        onProgress?.(`  → OK — ${clickThemes.themes.length} thème(s) — inscrit=${isInscrit}`)
+      } catch (err) {
+        errors++
+        onProgress?.(`  → ERREUR — ${err instanceof Error ? err.message : String(err)}`)
+      }
+
+      // 150ms between contacts to stay under HubSpot v1 rate limit (100 req/10s)
+      if (i < clickers.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 150))
+      }
+    }
+
+    // ── 6. Advance cursor + release lock (single atomic upsert) ───────────
+    const newOffset = startOffset + clickers.length
+    const fullCycle = newOffset >= effectiveTotal
+    const endIso = new Date().toISOString()
+
+    const cursorUpdate = {
+      id: 'main',
+      current_offset: fullCycle ? 0 : newOffset,
+      total_contacts: total,
+      last_run_at: endIso,
+      full_cycle_completed_at: fullCycle ? endIso : previousFullCycleAt,
+      locked_until: null,
+    }
+
+    const { error: updateErr } = await supabase.from('sync_cursor').upsert(cursorUpdate)
+    if (updateErr) {
+      onProgress?.(`[sync] ⚠ Mise à jour curseur échouée — ${updateErr.message}`)
+    } else {
+      lockAcquired = false // released successfully
+    }
+
+    const duration = Date.now() - start
+    if (fullCycle) onProgress?.(`[sync] Cycle complet terminé — reset cursor à 0`)
+    onProgress?.(
+      `[sync] Terminé — ${synced} synced, ${errors} errors, ${(duration / 1000).toFixed(1)}s`
+    )
+
+    return {
+      synced,
+      errors,
+      duration,
+      startOffset,
+      endOffset: cursorUpdate.current_offset,
+      totalContacts: total,
+      fullCycleCompleted: fullCycle,
+      skipped: false,
+    }
+  } finally {
+    // Safety net: release lock if sync crashed before final upsert
+    if (lockAcquired) {
+      await supabase
+        .from('sync_cursor')
+        .update({ locked_until: null })
+        .eq('id', 'main')
+        .then(
+          () => {},
+          () => {} // swallow — release is best-effort
+        )
+    }
+  }
 }
