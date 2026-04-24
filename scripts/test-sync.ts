@@ -1,5 +1,5 @@
 /**
- * Test the full sync pipeline with cursor backup/restore.
+ * Tests the full sync pipeline with cursor backup/restore.
  * Processes 5 contacts starting from current cursor offset, then restores
  * the cursor to its pre-test value — never pollutes prod state.
  *
